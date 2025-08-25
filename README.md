@@ -3,7 +3,7 @@
 This repository contains the R-based workflow developed for the paper:  
 
 **Neutral Molecular Networks: polarity-independent tool for mass spectrometry data analysis**  
-*Nicola Dalla Valle, Pietro Franceschi, Mar Garcia Aloy, Peter Robatscher, Michael Oberhuber*  
+*Nicola Dalla Valle, Pietro Franceschi, Mar Garcia Aloy, Peter Robatscher and Michael Oberhuber*  
 
 ---
 
@@ -14,9 +14,9 @@ Untargeted metabolomics using mass spectrometry is typically performed separatel
 In this work, we introduce **Neutral Molecular Networks (NMNs)**, a strategy that:  
 - Merges positive and negative mode MS/MS fragmentation spectra into **neutral pseudo-spectra**.  
 - Builds polarity-independent molecular networks, fastening MS data analysis.  
-- Improves chemical informativity, and compound annotation accuracy.  
+- Improves chemical informativity and compound annotation accuracy.  
 
-The workflow is  implemented in R Markdown files, making it reproducible.  
+The workflow is implemented in R Markdown files, making it reproducible.  
 
 ---
 
