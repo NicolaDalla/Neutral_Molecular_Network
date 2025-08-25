@@ -1,0 +1,168 @@
+---
+title: "MNs_evaluation"
+author: "Nicola Dalla Valle"
+date: "2025-08-25"
+output: html_document
+---
+
+Code for Molecular Network building and their comparison according to structural metrics, as assortativity and modularity, based on both chemical classes and subclasses
+
+assumning that we have produced the 3 polarities MS/MS datasets according to the .rmd "libraries_neutral_spectra_creation", we can proceed with the calcualtion of similarity matrices using GNPS score calcualtion
+
+making matrices
+
+```{r}
+#neutral
+matrix <- compareSpectra(MS2neu_cl, MAPFUN = joinPeaksGnps, tolerance = 0.01, 
+                         FUN = MsCoreUtils::gnps)
+rownames(matrix) <- MS2neu_cl$id
+colnames(matrix) <- MS2neu_cl$id
+#positive
+matrix_pos <- compareSpectra(MS2pos_cl, MAPFUN = joinPeaksGnps, tolerance = 0.01, 
+                             FUN = MsCoreUtils::gnps, BPPARAM = SnowParam(10))
+rownames(matrix_pos) <- MS2pos_cl$id
+colnames(matrix_pos) <- MS2pos_cl$id
+#negative
+matrix_neg <- compareSpectra(MS2neg_cl, MAPFUN = joinPeaksGnps, tolerance = 0.01, 
+                             FUN = MsCoreUtils::gnps, BPPARAM = SnowParam(10))
+rownames(matrix_neg) <- MS2neg_cl$id
+colnames(matrix_neg) <- MS2neg_cl$id
+```
+
+considering only class with more than 10 spectra
+
+```{r}
+cltab <- as.data.frame(table(MS2pos_cl$class)) %>%
+  filter(Freq>10)
+filter_pos <- MS2pos_cl[which(MS2pos_cl$class %in% cltab$Var1)]
+filtered<- data.frame(id=filter_pos$id,
+                           class=filter_pos$class)
+mtx <-matrix[which(rownames(matrix) %in% filtered$id),which(rownames(matrix) %in% filtered$id)]
+mtx_pos <-matrix_pos[which(rownames(matrix_pos) %in% filtered$id),which(rownames(matrix_pos) %in% filtered$id)]
+mtx_neg <-matrix_neg[which(rownames(matrix_neg) %in% filtered$id),which(rownames(matrix_neg) %in% filtered$id)]
+```
+
+calcualting assortativity and modualrity for stratified resampling of 80% of library spectra for 25 times in order to consider varaibility 
+We are considering all range of similarity threshold, from 0 to 1.
+
+```{r}
+rep=25 #number of repetition
+
+replicates <- seq(1, rep, by= 1)
+reptab <- data.frame(n=replicates)
+reptab$data <- vector(mode="list", length = nrow(reptab))
+
+#making a weigthed sampling based on class
+class_weights <- filtered %>%
+  dplyr::count(class) %>%
+  mutate(weight = round(n*0.8)) 
+
+#loop for chemical similarity of connected nodes for each thr
+for(q in 1:nrow(reptab)){
+  #matirci 
+  sp <- data.frame(cl=class_weights$class)
+  sp$idn <- vector(mode="list", length=nrow(sp))
+  for(v in 1:nrow(class_weights)){
+    cl <- class_weights$class[v]
+    idx <- MS2pos_cl$id[which(MS2pos_cl$class == cl)]
+    idn <- sample(idx,class_weights$weight[v])
+    sp$idn[[v]] <- idn
+  }
+  sp <- unlist(sp$idn)
+  sneu <- MS2neu_cl[which(MS2neu_cl$id%in% sp)]
+  sneg <- MS2neg_cl[which(MS2neg_cl$id%in% sp)]
+  spos <-MS2pos_cl[which(MS2pos_cl$id%in% sp)]
+  matrix2 <- mtx[which(rownames(mtx) %in% sneu$id),which(rownames(mtx) %in% sneu$id)]
+  matrix_pos2 <- mtx_pos[which(rownames(mtx_pos) %in% spos$id),which(rownames(mtx_pos) %in% spos$id)]
+  matrix_neg2 <- mtx_neg[which(rownames(mtx_neg) %in% sneg$id),which(rownames(mtx_neg) %in% sneg$id)]
+  
+  megatab<- data.frame(thr=seq(0,1,0.025),
+                       Apos=NA,
+                       Mpos=NA,
+                       Aneu=NA,
+                       Mneu=NA,
+                       Aneg=NA,
+                       Mneg=NA,
+                       Apos_scl=NA,
+                       Mpos_scl=NA,
+                       Aneu_scl=NA,
+                       Mneu_scl=NA,
+                       Aneg_scl=NA,
+                       Mneg_scl=NA,
+                       Eneu=NA,
+                       Epos=NA,
+                       Eneg=NA)
+  
+  #calcolo similairtà per ogni fisrt degree parent
+  
+  for(k in 1:nrow(megatab)){
+    thr<- megatab$thr[k]
+    #Neutral graph
+    all_nodes <- data.frame(
+      id = sneu$id, 
+      class=sneu$class,
+      subclass=sneu$subclass
+    )
+    edges<- create_edge_list(matrix2, thr, sneu)
+    megatab$Eneu[k]<- nrow(edges)
+    graph<- graph_from_data_frame(d = edges, vertices = all_nodes, directed = FALSE)
+    graph_neu<- graph
+    #Positive graph
+    all_nodes <- data.frame(
+      name=spos$id,
+      class=spos$class,
+      subclass=spos$subclass
+    )
+    edges<- create_edge_list(matrix_pos2, thr, spos)
+    megatab$Epos[k]<- nrow(edges)
+    graph<- graph_from_data_frame(d = edges, vertices = all_nodes, directed = FALSE)
+    graph_pos<- graph
+    #Negative graph
+    all_nodes <- data.frame(
+      name=sneg$id,
+      class=sneg$class,
+      subclass=sneg$subclass
+    )
+    edges<- create_edge_list(matrix_neg2, thr, sneg)
+    megatab$Eneg[k]<- nrow(edges)
+    graph<- graph_from_data_frame(d = edges, vertices = all_nodes, directed = FALSE)
+    graph_neg<- graph
+
+    #class
+    V(graph_neu)$class <-as.integer(as.factor(V(graph_neu)$class))
+    V(graph_neu)$class[is.na(V(graph_neu)$class)]<-99
+    megatab$Aneu[k]<-assortativity_nominal(graph_neu,V(graph_neu)$class)
+    megatab$Mneu[k]<-modularity(graph_neu,membership=V(graph_neu)$class)
+    #subclass
+    V(graph_neu)$subclass <-as.integer(as.factor(V(graph_neu)$subclass))
+    V(graph_neu)$subclass[is.na(V(graph_neu)$subclass)]<-99
+    megatab$Aneu_scl[k]<-assortativity_nominal(graph_neu,V(graph_neu)$subclass)
+    megatab$Mneu_scl[k]<-modularity(graph_neu,membership=V(graph_neu)$subclass)
+    #graph pos 
+    #class
+    V(graph_pos)$class <-as.integer(as.factor(V(graph_pos)$class))
+    V(graph_pos)$class[is.na(V(graph_pos)$class)]<-99
+    megatab$Apos[k]<-assortativity_nominal(graph_pos,V(graph_pos)$class)
+    megatab$Mpos[k]<-modularity(graph_pos,membership=V(graph_pos)$class)
+    #subclass
+    V(graph_pos)$subclass <-as.integer(as.factor(V(graph_pos)$subclass))
+    V(graph_pos)$subclass[is.na(V(graph_pos)$subclass)]<-99
+    megatab$Apos_scl[k]<-assortativity_nominal(graph_pos,V(graph_pos)$subclass)
+    megatab$Mpos_scl[k]<-modularity(graph_pos,membership=V(graph_pos)$subclass)
+    #graph neg
+    #class
+    V(graph_neg)$class <-as.integer(as.factor(V(graph_neg)$class))
+    V(graph_neg)$class[is.na(V(graph_neg)$class)]<-99
+    megatab$Aneg[k]<-assortativity_nominal(graph_neg,V(graph_neg)$class)
+    megatab$Mneg[k]<-modularity(graph_neg,membership=V(graph_neg)$class)
+    #subclass
+    V(graph_neg)$subclass <-as.integer(as.factor(V(graph_neg)$subclass))
+    V(graph_neg)$subclass[is.na(V(graph_neg)$subclass)]<-99
+    megatab$Aneg_scl[k]<-assortativity_nominal(graph_neg,V(graph_neg)$subclass)
+    megatab$Mneg_scl[k]<-modularity(graph_neg,membership=V(graph_neg)$subclass)
+  }
+  
+  reptab$data[[q]]<- megatab
+  
+}
+```
