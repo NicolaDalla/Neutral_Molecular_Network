@@ -1,0 +1,329 @@
+---
+title: "library_workflow"
+author: "Nicola Dalla Valle"
+date: "2025-08-25"
+output: html_document
+---
+
+code used for libraies file extraction with the following MS/MS selection and neutral pseudo-spectra creation for compound with both polarities data.
+
+```{r}
+library(dplyr)
+library(tidyverse)
+library(purrr)
+library(stringr)
+library(jsonlite)
+library(Spectra)
+library(MSnbase)
+library(BiocParallel)
+library(sampling)
+library(MASS)
+
+process_data <- function(data) {
+  data <- data %>%
+    arrange(mz) %>%
+    mutate(group = cumsum(c(TRUE, diff(mz) >= 0.0005))) %>%
+    group_by(group) %>%
+    summarise(
+      mz = mean(mz),
+      intensity = mean(intensity)
+    ) %>%
+    ungroup() %>%
+    dplyr::select(-group)
+  return(data)
+} 
+
+create_edge_list <- function(similarity_matrix, thr, spectra) {
+  non_zero_indices <- which(similarity_matrix > thr, arr.ind = TRUE)
+  if (length(non_zero_indices) > 0 && is.null(dim(non_zero_indices))) {
+    non_zero_indices <- matrix(non_zero_indices, ncol = 2, byrow = TRUE)
+  }
+  if (length(non_zero_indices) == 0) {
+    return(data.frame(from = character(), to = character(), weight = numeric()))
+  }
+  non_zero_indices <- non_zero_indices[non_zero_indices[, 1] < non_zero_indices[, 2], , drop = FALSE]
+  if (nrow(non_zero_indices) == 0) {
+    return(data.frame(from = character(), to = character(), weight = numeric()))
+  }
+  # Create an edge list from these indices
+  edges <- data.frame(
+    from = spectra$id[non_zero_indices[, 1]],
+    to = spectra$id[non_zero_indices[, 2]],
+    weight = similarity_matrix[non_zero_indices]
+  )
+  
+  return(edges)
+}
+
+cleaning_ref<- function(ms2){
+   if (length(mz(ms2)) <= 30) {  #apply cleaning for MS/MS with more than 30 ions
+    return(ms2)
+  }
+ms2_tb <- as.data.frame(
+    spectraData(sps) 
+  ) %>%
+    mutate( ms2_raw = mapply(cbind, mz(ms2), intensity(ms2), SIMPLIFY = FALSE)) %>%
+    mutate(ms2_raw = map(ms2_raw, function(t){
+      colnames(t) <- c("mz", "intensity")
+      t %>%
+        as.data.frame() %>%
+        mutate(mz = as.numeric(mz)) %>%
+        mutate(intensity = as.numeric(intensity))
+    })) %>%
+    mutate(ms2_RLM = map(ms2_raw, function(t){
+      t <- t %>%
+        filter(intensity>0) %>%
+        arrange(intensity) %>%
+        mutate(order = seq(nrow(.)))
+      p75 <- t %>%
+        pull(intensity) %>% 
+        quantile(0.75)
+      u <- t %>%
+        filter(intensity < p75)
+      if(nrow(u)>3){
+        mdl <- rlm(data = u, log10(intensity) ~ order)
+        t_filt<- t %>% 
+          mutate(pred = predict(mdl, t)) %>%
+          mutate(res = abs(pred - log10(intensity))) %>%
+          filter(res > sd(residuals(mdl))*3) %>%
+          arrange(mz)
+        if (nrow(t_filt) > 0) {
+          t<- t_filt
+        } else {
+          t<- t %>% arrange(mz)
+        }
+      } else {
+        return(t %>% arrange(mz))  # Not enough points to model
+      }
+    }))
+  ms2_cl <- ms2_tb %>%
+    mutate(
+      mz = map(ms2_RLM, ~ .x$mz),
+      intensity = map(ms2_RLM, ~ .x$intensity)
+    ) %>%
+    filter(map_lgl(mz, ~ length(.x) > 0)) %>%
+    as.data.frame() %>%
+    Spectra()
+  return(ms2_cl)
+}
+
+
+```
+
+json library from MONA repository
+
+```{r}
+#assuming our libraries is downloaded ad .JSON file in "path" variable
+fls <- fromJSON(path)
+fls <- fls %>%
+  dplyr::select("compound","id", "metaData", "annotations", "spectrum")
+```
+
+extracting interesting variables from dataset
+
+```{r}
+fls$pol <- sapply(fls$metaData, function(x) {
+  x<- as.data.frame(x)    
+  ionization_row <- which(x$name == "ionization mode")
+  return(x$value[ionization_row])
+       })
+fls$adduct <- sapply(fls$metaData, function(x) {
+  x<- as.data.frame(x)    
+  ionization_row <- which(x$name == "precursor type")
+  return(x$value[ionization_row])
+       })
+fls$precursorMz <- sapply(fls$metaData, function(x) {
+  x<- as.data.frame(x)    
+  ionization_row <- which(x$name == "precursor m/z")
+  return(x$value[ionization_row])
+       })
+fls$instrument <- sapply(fls$metaData, function(x) {
+  x<- as.data.frame(x)    
+  ionization_row <- which(x$name == "instrument type")
+  return(x$value[ionization_row])
+       })
+fls$entropy <- sapply(fls$metaData, function(x) {
+  x<- as.data.frame(x)    
+  ionization_row <- which(x$name == "spectral entropy")
+  return(x$value[ionization_row])
+       })
+fls$inchi <- sapply(fls$compound, function(x){
+  tab <- as.data.frame(x$metaData)
+  idx <- which(tab$name == "InChIKey")
+  return(tab$value[idx])
+})
+
+fls$author <- sapply(fls$metaData, function(x) {
+  x<- as.data.frame(x) 
+  ionization_row <- which(x$name == "author")
+  return(x$value[ionization_row])
+       })
+
+fls <- fls %>%
+  mutate(
+    mz = lapply(spectrum, function(x) {
+      if (!is.na(x)) as.numeric(str_extract_all(x, "[0-9\\.]+(?=:)")[[1]]) else NA
+    }),
+    intensity = lapply(spectrum, function(x) {
+      if (!is.na(x)) as.numeric(str_extract_all(x, "(?<=:)[0-9\\.]+")[[1]]) else NA
+    })
+  )
+
+#extracting class variable
+
+fls$class <- sapply(fls$compound, function(x) {
+  if (!"classification" %in% names(x) || is.null(x$classification)) {
+    return(NA)  
+  }
+  class_df <- as.data.frame(x$classification)
+  idx <- which(class_df$name == "class")
+  if (length(idx) > 0) {
+    return(class_df$value[idx])
+  } else {
+    return(NA)
+  }
+})
+fls$subclass <- sapply(fls$compound, function(x) {
+  if (is.null(x$classification)) {
+    return(NA)  
+  }
+  class_df <- as.data.frame(x$classification)
+  idx <- which(class_df$name == "subclass")
+  if (length(idx) > 0) {
+    return(class_df$value[idx])
+  } else {
+    return(NA)
+  }
+})
+fls$superclass <- sapply(fls$compound, function(x) {
+  if (is.null(x$classification)) {
+    return(NA)  
+  }
+  class_df <- as.data.frame(x$classification)
+  idx <- which(class_df$name == "superclass")
+  if (length(idx) > 0) {
+    return(class_df$value[idx])
+  } else {
+    return(NA)
+  }
+})
+head(fls)
+```
+
+producing spectra object
+
+```{r}
+fls$polarity <- ifelse(fls$pol=="positive",1,0) %>%
+  as.integer()
+fls$precursorMz <- as.numeric(fls$precursorMz)
+fls<- fls[which(sapply(fls$inchi, length)==1),]
+allsps <- fls%>%
+  dplyr::select(-"compound", "annotations", "metaData", "spectrum","pol") %>%
+  Spectra(.)
+allsps$inchi <- unlist(allsps$inchi)
+allsps$id <- allsps$inchi
+
+```
+
+selecting the common spectra and making neutral accodring to inchi varaible of spectra. Considering fragemntation spectra from "[M-H]-" and "[M+H]+" adduct only.
+
+```{r}
+MS2neg <- allsps[allsps$polarity==0] 
+MS2neg <- MS2neg[which(MS2neg$adduct=="[M-H]-")]
+MS2pos <- allsps[allsps$polarity==1]
+MS2pos <- MS2pos[which(MS2pos$adduct=="[M+H]+")]
+
+comminchi <- intersect(MS2neg$inchi, MS2pos$inchi)  
+MS2neg <- MS2neg[which(MS2neg$inchi %in% comminchi)]
+MS2pos <- MS2pos[which(MS2pos$inchi %in% comminchi)]
+
+#if duplicated, I keep the one with lowest entropy                 
+lis <- c()
+if(length(table(duplicated(MS2neg$inchi)))){
+  d<- unique(MS2neg$inchi[which(duplicated(MS2neg$inchi))])
+  for(i in 1:length(d)){
+    e<-c()
+    spx <- which(MS2neg$inchi ==d[i])
+    idx <- spx[which.min(MS2neg$entropy[spx])]
+    e <- spx[spx!=idx]
+    lis<- c(e, lis)
+  }
+  lis <- unique(lis)
+}
+tokeep <-  setdiff(seq_along(MS2neg), lis)
+MS2neg <- MS2neg[tokeep]
+
+MS2pos <- MS2pos[which(MS2pos$inchi %in% comminchi)]
+```
+
+cleaning the spectra with more than 30 ions 
+
+```{r}
+MS2pos_cl <- cleaning_ref(MS2pos)
+MS2neg_cl <- cleaning_ref(MS2neg)
+
+hist(unlist(lapply(mz(MS2pos_cl), function(x) length(x))))
+```
+
+creating neutral pseudo-spectra for each compound that have negative and positive MS/MS spectra
+
+```{r}
+MS2neg_cl$inchi <- MS2neg_cl$id
+MS2pos_cl$inchi <- MS2pos_cl$id
+
+neutral_spectra<- Spectra()
+
+for(i in 1:length(MS2pos_cl)){
+  register(SerialParam())
+  #positive
+  fl <- MS2pos_cl
+  akap <- fl[i]
+    if(length(akap)>0){
+    mzpos <- mz(akap)[[1]] 
+    mzpos <- mzpos - 1.00728
+    intpos <- intensity(akap)[[1]]
+    intpos <- (intpos/max(intpos))*100
+    df_pos <- data.frame(mz = mzpos, intensity = intpos)
+    #negative
+    fl <- MS2neg_cl
+    akan <- fl[which(fl$inchi==akap$inchi)]
+        if(length(akan)>0){
+      mzneg <- mz(akan)[[1]] 
+      mzneg <- mzneg + 1.00728
+      intneg <- intensity(akan)[[1]]
+      intneg <- (intneg/max(intneg))*100
+      df_neg <- data.frame(mz = mzneg, intensity = intneg) 
+          
+      #both
+      df <- bind_rows(df_neg, df_pos) %>%
+        arrange(mz)
+      df<- as.data.frame(process_data(df))
+      totmz<- as.numeric(df$mz)
+      totint <- as.numeric(df$intensity)
+      
+      prec<- mean(c(precursorMz(akan),precursorMz(akap)))
+      
+      spectrum<- data.frame(
+        id= akap$inchi,
+        mz = I(list(totmz)),
+        intensity = I(list(totint)),
+        precursorMz=prec
+      )
+      sps <- Spectra(spectrum)
+      neutral_spectra <- c(neutral_spectra, sps)
+    }
+  }
+  print(i)
+}
+
+#keeping the class and subclass varibales
+neutral_spectra$class <- NA
+for(i in 1:length(neutral_spectra)){
+  neutral_spectra$class[i] <- MS2pos_cl$class[which(MS2pos_cl$inchi==neutral_spectra$id[i])]
+}
+
+neutral_spectra$subclass <- NA
+for(i in 1:length(neutral_spectra)){
+  neutral_spectra$subclass[i] <- MS2pos_cl$subclass[which(MS2pos_cl$inchi==neutral_spectra$id[i])]
+}
+```
