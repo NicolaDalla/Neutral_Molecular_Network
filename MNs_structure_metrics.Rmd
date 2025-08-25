@@ -5,6 +5,15 @@ date: "2025-08-25"
 output: html_document
 ---
 
+```{r}
+library(Spectra)
+library(MsCoreUtils)
+library(BiocParallel)
+library(igraph)
+library(dplyr)
+library(tidyverse)
+```
+
 Code for Molecular Network building and their comparison according to structural metrics, as assortativity and modularity, based on both chemical classes and subclasses
 
 assumning that we have produced the 3 polarities MS/MS datasets according to the .rmd "libraries_neutral_spectra_creation", we can proceed with the calcualtion of similarity matrices using GNPS score calcualtion
@@ -165,4 +174,5 @@ for(q in 1:nrow(reptab)){
   reptab$data[[q]]<- megatab
   
 }
+
 ```
