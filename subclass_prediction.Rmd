@@ -1,0 +1,229 @@
+---
+title: "neighbors_subclass_matches"
+author: "Nicola Dalla Valle"
+date: "2025-08-25"
+output: html_document
+---
+
+```{r}
+create_edge_list <- function(similarity_matrix, thr, spectra) {
+  non_zero_indices <- which(similarity_matrix > thr, arr.ind = TRUE)
+  if (length(non_zero_indices) > 0 && is.null(dim(non_zero_indices))) {
+    non_zero_indices <- matrix(non_zero_indices, ncol = 2, byrow = TRUE)
+  }
+  if (length(non_zero_indices) == 0) {
+    return(data.frame(from = character(), to = character(), weight = numeric()))
+  }
+  non_zero_indices <- non_zero_indices[non_zero_indices[, 1] < non_zero_indices[, 2], , drop = FALSE]
+  if (nrow(non_zero_indices) == 0) {
+    return(data.frame(from = character(), to = character(), weight = numeric()))
+  }
+  # Create an edge list from these indices
+  edges <- data.frame(
+    from = spectra$id[non_zero_indices[, 1]],
+    to = spectra$id[non_zero_indices[, 2]],
+    weight = similarity_matrix[non_zero_indices]
+  )
+  
+  return(edges)
+}
+```
+
+assuming thath we have our dataset divided by polarity (as described in "libraries_neutral_spectra_creation.Rmd") and we have calcualted our matrices of spectra similarity, we can porceed we the evaluation of ability to predict the subcless of a putative "unknown" node in MNs acording to a majority vote considering their neighburs. Calculation was made considering up to the top 10 neighbors according to spectral similarity applied to a zero MN threshold.
+
+Creation of MNs for all the 3 polarties
+
+```{r}
+#handling NAs values, if present
+sub <- MS2neu_cl[!is.na(MS2neu_cl$subclass)]
+subn <- MS2neg_cl[!is.na(MS2neg_cl$subclass)]
+subp <- MS2pos_cl[!is.na(MS2pos_cl$subclass)]
+
+matrix2 <-matrix[which(rownames(matrix) %in% sub$id),which(rownames(matrix) %in% sub$id)]
+matrix_pos2 <-matrix_pos[which(rownames(matrix_pos) %in% subp$id),which(rownames(matrix_pos) %in% subp$id)]
+matrix_neg2 <-matrix_neg[which(rownames(matrix_neg) %in% subn$id),which(rownames(matrix_neg) %in% subn$id)]
+
+thr<- 0.0
+#neutral
+all_nodes <- data.frame(
+  id = sub$id, 
+  class=subp$subclass
+)
+edges<- create_edge_list(matrix2, thr, sub)
+gneu <- graph_from_data_frame(d = edges, vertices = all_nodes, directed = FALSE)
+
+#pos
+all_nodes_p <- data.frame(
+  id = subp$inchi,
+  class=subp$subclass
+)
+edges<- create_edge_list(matrix_pos2, thr, subp)
+gpos <- graph_from_data_frame(d = edges, vertices = all_nodes_p, directed = FALSE)
+
+#neg
+all_nodes_n <- data.frame(
+  id = subn$inchi,
+  class=subn$subclass
+)
+edges<- create_edge_list(matrix_neg2, thr, subn)
+gneg <- graph_from_data_frame(d = edges, vertices = all_nodes_n, directed = FALSE)
+```
+
+calcualtion of correct chemical subclass prediction according to majority vote
+25 repetition to estimate variability, random selection of 50 compounds within each network where mean of correct prediction were considered.
+
+```{r}
+gigatab<- data.frame(rep=seq(1,25,1))
+gigatab$data <- vector(mode="list", length=nrow(gigatab))
+
+for(w in 1:nrow(gigatab)){
+  seq <- seq(1,10,1)
+  maintab<- data.frame(n=seq,
+                       neu=NA,
+                       pos=NA,
+                       neg=NA)
+  maintab$data <- vector(mode="list", length=nrow(maintab))
+  baba<- MS2neu_cl[!is.na(MS2neu_cl$subclass)]
+  
+  ink<- sample(baba$id,50)
+  
+  for(j in 1:nrow(maintab)){
+    ntab <- data.frame(n=ink,
+                       neu=NA,
+                       pos=NA,
+                       neg=NA,
+                       real_cl=NA)
+    for(k in 1:nrow(ntab)){
+      name <- ntab$n[k]
+      real_cl <- MS2neu_cl$subclass[which(MS2neu_cl$id==name)]
+      ntab$real_cl[k]<- real_cl
+      #neutral
+      edges <- E(gneu)[incident(gneu, name)]
+      edges_df <- data.frame(
+        from = ends(gneu, edges)[, 1],
+        to = ends(gneu, edges)[, 2],
+        weight = E(gneu)[edges]$weight
+      ) %>%
+        arrange(desc(weight))
+      edges_df <- edges_df[1:j,]
+      edges_df <- edges_df[!is.na(edges_df$weight),]
+      edges_df$conn<-NA
+      edges_df$conn[which(edges_df$from!=name)] <- edges_df$from[which(edges_df$from!=name)]
+      edges_df$conn[which(edges_df$to!=name)] <- edges_df$to[which(edges_df$to!=name)]
+      edges_df$class <- sapply(edges_df$conn,function(x) MS2neu_cl$subclass[which(MS2neu_cl$id==x)])
+      if(length(edges_df$class )>0){
+        stimated_cl <-  names(which.max(table(edges_df$class)))
+        ntab$neu[k] <- stimated_cl
+        weighted_votes <- aggregate(weight ~ class, data = edges_df, sum)
+        stimated_cl <- weighted_votes$class[which.max(weighted_votes$weight)]
+        ntab$wneu[k] <- stimated_cl
+      }
+      #positive
+      edges <- E(gpos)[incident(gpos, name)]
+      edges_df <- data.frame(
+        from = ends(gpos, edges)[, 1],
+        to = ends(gpos, edges)[, 2],
+        weight = E(gpos)[edges]$weight
+      ) %>%
+        arrange(desc(weight))
+      edges_df <- edges_df[1:j,]
+      edges_df <- edges_df[!is.na(edges_df$weight),]
+      edges_df$conn<-NA
+      edges_df$conn[which(edges_df$from!=name)] <- edges_df$from[which(edges_df$from!=name)]
+      edges_df$conn[which(edges_df$to!=name)] <- edges_df$to[which(edges_df$to!=name)]
+      edges_df$class <- sapply(edges_df$conn,function(x) MS2neu_cl$subclass[which(MS2neu_cl$id==x)])
+      if(length(edges_df$class )>0){
+        stimated_cl <-  names(which.max(table(edges_df$class)))
+        ntab$pos[k] <- stimated_cl
+        weighted_votes <- aggregate(weight ~ class, data = edges_df, sum)
+        stimated_cl <- weighted_votes$class[which.max(weighted_votes$weight)]
+        ntab$wpos[k] <- stimated_cl
+      }
+      
+      #negative
+      edges <- E(gneg)[incident(gneg, name)]
+      edges_df <- data.frame(
+        from = ends(gneg, edges)[, 1],
+        to = ends(gneg, edges)[, 2],
+        weight = E(gneg)[edges]$weight
+      ) %>%
+        arrange(desc(weight))
+      edges_df <- edges_df[1:j,]
+      edges_df <- edges_df[!is.na(edges_df$weight),]
+      edges_df$conn<-NA
+      edges_df$conn[which(edges_df$from!=name)] <- edges_df$from[which(edges_df$from!=name)]
+      edges_df$conn[which(edges_df$to!=name)] <- edges_df$to[which(edges_df$to!=name)]
+      edges_df$class <- sapply(edges_df$conn,function(x) MS2neu_cl$subclass[which(MS2neu_cl$id==x)])
+      if(length(edges_df$class )>0){
+        stimated_cl <-  names(which.max(table(edges_df$class)))
+        ntab$neg[k] <- stimated_cl
+        weighted_votes <- aggregate(weight ~ class, data = edges_df, sum)
+        stimated_cl <- weighted_votes$class[which.max(weighted_votes$weight)]
+        ntab$wneg[k] <- stimated_cl
+      }
+    }
+    maintab$data[[j]] <- ntab
+    maintab$neu[j]<-length(which(ntab$neu==ntab$real_cl))
+    maintab$pos[j]<-length(which(ntab$pos==ntab$real_cl))
+    maintab$neg[j]<- length(which(ntab$neg==ntab$real_cl))
+    
+  }
+  print(w)
+  gigatab$data[[w]]<- maintab
+}
+
+all_res <- gigatab %>%
+  mutate(rep_id = row_number()) %>%
+  dplyr::select(rep_id, data) %>%
+  unnest(data) 
+
+summary_res <- all_res %>%
+  group_by(n) %>%
+  summarise(
+    neu_mean = mean(neu, na.rm=TRUE),
+    pos_mean = mean(pos, na.rm=TRUE),
+    neg_mean = mean(neg, na.rm=TRUE),
+    neu_sd = sd(neu, na.rm=TRUE),
+    pos_sd = sd(pos, na.rm=TRUE),
+    neg_sd = sd(neg, na.rm=TRUE),
+    .groups="drop"
+  )
+
+```
+
+considerign p-value to asses the significance of the difference between neutral NM and the best single polaorty MN for each number of considederd neighbour.
+
+```{r}
+all_res <- gigatab %>%
+  mutate(rep_id = row_number()) %>%
+  dplyr::select(rep_id, data) %>%
+  tidyr::unnest(data) %>%
+  dplyr::select(rep_id, n, neu, pos, neg)
+
+# Function: for each n, choose best of pos/neg and test vs neutral
+pvals <- all_res %>%
+  group_by(n) %>%
+  group_modify(~ {
+    df <- .x
+    
+    # Find which of pos/neg has higher mean
+    mean_pos <- mean(df$pos, na.rm=TRUE)
+    mean_neg <- mean(df$neg, na.rm=TRUE)
+    best_col <- if (mean_pos > mean_neg) "pos" else "neg"
+    
+    # Paired t-test: neutral vs best
+    test <- t.test(df$neu, df[[best_col]], paired=TRUE)
+    
+    tibble(
+      best_method = best_col,
+      mean_neu = mean(df$neu, na.rm=TRUE),
+      mean_best = mean(df[[best_col]], na.rm=TRUE),
+      p_value = test$p.value
+    )
+  }) %>%
+  ungroup()
+
+```
+
+
+
