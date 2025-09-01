@@ -38,123 +38,63 @@ for (i in seq_along(tmp$result)) {
 }
   std_tab <- std_tab[!is.na(std_tab$smile),] 
  
-n <-10 #top match to consider
+# function for chemical similarity
 
-for(j in 1:nrow(std_tab)){
+compute_similarity <- function(cpname, sdfx, sim_matrix, n = 10) {
+  # Subset top matches
+  smat <- sim_matrix[rownames(sim_matrix) == cpname, ]
+  dfmat <- data.frame(id = colnames(sim_matrix), score = smat) %>%
+    arrange(desc(score)) %>%
+    filter(id != cpname) %>%
+    head(n)
+  dfmat$overl <- NA
+  dfmat$tani  <- NA
+
+  for (i in seq_len(nrow(dfmat))) {
+    tmp <- tryCatch({
+      get_properties("SMILES", dfmat$id[i], namespace = "inchikey")
+    }, error = function(e) NULL)
+    
+    if (is.null(tmp) || length(tmp$result) == 0) next
+    
+    smilez <- sapply(tmp$result, function(x) {
+      if (!is.null(x$result$PropertyTable$Properties[[1]]$SMILES)) {
+        x$result$PropertyTable$Properties[[1]]$SMILES
+      } else NA
+    })
+    if (all(is.na(smilez))) next
+    sdfz <- tryCatch({
+      smiles2sdf(as.character(smilez))
+    }, error = function(e) NULL)
+    if (is.null(sdfz)) next
+    sim <- tryCatch({
+      fmcs(sdfx, sdfz, matching.mode = "static")
+    }, error = function(e) NULL)
+    if (is.null(sim)) next
+    stats <- as.data.frame(sim@stats)
+    if (nrow(stats) >= 5) {
+      dfmat$overl[i] <- stats[5, 1]
+      dfmat$tani[i]  <- stats[4, 1]
+    }
+
+    rm(sdfz, sim, tmp, smilez)
+  }
+  
+  return(dfmat)
+}
+
+#applying the function
+n <- 10  #number of top spectral matches considered
+for (j in 1:nrow(std_tab)) {
   cpname <- std_tab$name[j]
   smilex <- std_tab$smile[j]
-  if(length(smilex)>0 & !is.na(smilex)){
+  
+  if (!is.na(smilex)) {
+    sdfx <- smiles2sdf(smilex)
     
-    sdfx<- smiles2sdf(smilex)
-    
-    #NEUTRAL
-    #selecting the first 10 matches of similarity score
-    smat <- matrix[which(rownames(matrix)==cpname),]
-    dfmat <- data.frame(id=colnames(matrix), 
-                        score= smat) %>%
-      arrange(desc(score)) %>%
-      filter(id!=cpname)
-    dfmat <- dfmat[1:n,]
-    dfmat$overl <- NA
-    dfmat$tani <- NA
-    connected_names <- dfmat$id
-    #calculatinjg chem similarity with top matches
-    if(length(connected_names)>0){
-      for(i in 1:length(connected_names)){
-        tmp <- get_properties(properties = "SMILES", identifier = connected_names[i], namespace = "inchikey")
-        smilez<- sapply(tmp$result, function(x) {
-          if (!is.null(x$result$PropertyTable$Properties[[1]]$SMILES)) {
-            x$result$PropertyTable$Properties[[1]]$SMILES
-          } else {
-            NA  
-          }
-        })
-      
-        if(!is.null(smilez)&!is.na(smilez)){
-          smilez <- as.character(smilez)
-                  sdfz <- smiles2sdf(smilez)
-        sim<- fmcs(sdfx, sdfz,matching.mode = "static")
-        dfmat$overl[i]<- as.data.frame(sim@stats)[5,1]
-        dfmat$tani[i]<- as.data.frame(sim@stats)[4,1]
-        }
-
-      }
-    }
-    
-    std_tab$neu[[j]] <- dfmat 
-    
-    
-    #POSITIVE
-    #selecting the first 10 matches of similarity score
-    smat <- matrix_pos[which(rownames(matrix_pos)==cpname),]
-    dfmat <- data.frame(id=colnames(matrix_pos), 
-                        score= smat) %>%
-      arrange(desc(score)) %>%
-      filter(id!=cpname)
-    dfmat <- dfmat[1:n,]
-    dfmat$overl <- NA
-    dfmat$tani <- NA
-    connected_names <- dfmat$id
-    #calculatinjg chem similarity with top matches
-    if(length(connected_names)>0){
-            for(i in 1:length(connected_names)){
-        tmp <- get_properties(properties = "SMILES", identifier = connected_names[i], namespace = "inchikey")
-        smilez<- sapply(tmp$result, function(x) {
-          if (!is.null(x$result$PropertyTable$Properties[[1]]$SMILES)) {
-            x$result$PropertyTable$Properties[[1]]$SMILES
-          } else {
-            NA  
-          }
-        })
-      
-        if(!is.null(smilez)&!is.na(smilez)){
-          smilez <- as.character(smilez)
-                  sdfz <- smiles2sdf(smilez)
-        sim<- fmcs(sdfx, sdfz,matching.mode = "static")
-        dfmat$overl[i]<- as.data.frame(sim@stats)[5,1]
-        dfmat$tani[i]<- as.data.frame(sim@stats)[4,1]
-        }
-
-      }
-    }
-    
-    std_tab$pos[[j]] <- dfmat 
-    
-    #NEGATIVE
-    #selecting the first 10 matches of similarity score
-    smat <- matrix_neg[which(rownames(matrix_neg)==cpname),]
-    dfmat <- data.frame(id=colnames(matrix_neg), 
-                        score= smat) %>%
-      arrange(desc(score)) %>%
-      filter(id!=cpname)
-    dfmat <- dfmat[1:n,]
-    dfmat$overl <- NA
-    dfmat$tani <- NA
-    connected_names <- dfmat$id
-    #calculatinjg chem similarity with top matches
-    if(length(connected_names)>0){
-      for(i in 1:length(connected_names)){
-        tmp <- get_properties(properties = "SMILES", identifier = connected_names[i], namespace = "inchikey")
-        smilez<- sapply(tmp$result, function(x) {
-          if (!is.null(x$result$PropertyTable$Properties[[1]]$SMILES)) {
-            x$result$PropertyTable$Properties[[1]]$SMILES
-          } else {
-            NA  
-          }
-        })
-      
-        if(!is.null(smilez)&!is.na(smilez)){
-          smilez <- as.character(smilez)
-                  sdfz <- smiles2sdf(smilez)
-        sim<- fmcs(sdfx, sdfz,matching.mode = "static")
-        dfmat$overl[i]<- as.data.frame(sim@stats)[5,1]
-        dfmat$tani[i]<- as.data.frame(sim@stats)[4,1]
-        }
-
-      }
-    }
-    
-    std_tab$neg[[j]] <- dfmat 
+    std_tab$neu[[j]] <- compute_similarity(cpname, sdfx, matrix, n)
+    std_tab$pos[[j]] <- compute_similarity(cpname, sdfx, matrix_pos, n)
+    std_tab$neg[[j]] <- compute_similarity(cpname, sdfx, matrix_neg, n)
   }
 }
 
@@ -165,7 +105,7 @@ calculating the average cumulative TANIMOTO value for different similarity score
 ```{r}
 thrs <-  seq(0,1,0.05)
 
-# ---- Define function to get cumulative Tanimoto vs rank and score threshold ----
+#Define function to get cumulative Tanimoto vs rank and score threshold
 get_tani_curve_thresholded <- function(df_list, names_vec, score_list, mode_label, thrs = seq(0, 1, 0.05)) {
   res <- list()
   for (i in seq_along(df_list)) {
@@ -209,7 +149,7 @@ calculating the average cumulative OVERLAY value for different similarity score 
 ```{r}
 thrs <-  seq(0,1,0.05)
 
-# ---- Define function to get cumulative Overlay vs rank and score threshold ----
+#Define function to get cumulative Overlay vs rank and score threshold
 get_over_curve_thresholded <- function(df_list, names_vec, score_list, mode_label, thrs = seq(0, 1, 0.05)) {
   res <- list()
   for (i in seq_along(df_list)) {
@@ -245,5 +185,4 @@ overlay_pos_thr <- get_over_curve_thresholded(std_tab$pos, std_tab$name, std_tab
 overlay_neg_thr <- get_over_curve_thresholded(std_tab$neg, std_tab$name, std_tab$neg, "Negative", thrs)
 overlay_neu_thr <- get_over_curve_thresholded(std_tab$neu, std_tab$name, std_tab$neu, "Neutral", thrs)
 
-over_all_thr <- bind_rows(overlay_neg_thr, overlay_pos_thr, overlay_neu_thr)
 ```
