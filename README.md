@@ -34,7 +34,7 @@ The workflow is implemented in R Markdown files, making it reproducible.
 - **`subclass_prediction.Rmd`**  
   Subclass prediction from network neighborhoods based on majority vote for MSMS library.  
 
-- *(To be added)* **Alternaria dataset analysis**  
-  Case study on fungal metabolomics. Include: MS data processing, identification of neagtive/positive feature pairs and the demostration of NMN clustering of toxin-related metabolites.  
+- **biological_sample_workflow**  
+  Case study on fungal metabolomics. Include: MS data processing, identification of neagtive/positive feature pairs and the demostration of NMN clustering of toxin-related features.  
 
 ---
