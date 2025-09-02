@@ -1,0 +1,588 @@
+---
+title: "merging_poneg"
+output: html_document
+date: "2024-06-27"
+---
+
+```{r}
+library(xcms)
+library(effectsize)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(rlang)
+library(MsCoreUtils)
+library(Spectra)
+library(MsBackendMgf)
+library(readr)
+library(stringr)
+library(MetaboCoreUtils)
+library(igraph)
+library(visNetwork)
+library(MsExperiment)
+library(RuSirius)
+library(stats)
+library(MetaboAnnotation)
+library(RColorBrewer)
+library(MASS)
+
+cleaning_ref<- function(ms2){
+  ms2_tb <- as.data.frame(
+    spectraData(ms2) 
+  ) %>%
+    mutate( ms2_raw = mapply(cbind, mz(ms2), intensity(ms2), SIMPLIFY = FALSE)) %>%
+    mutate(ms2_raw = map(ms2_raw, function(t){
+      colnames(t) <- c("mz", "intensity")
+      t %>%
+        as.data.frame() %>%
+        mutate(mz = as.numeric(mz)) %>%
+        mutate(intensity = as.numeric(intensity))
+    })) %>%
+    mutate(ms2_RLM = map(ms2_raw, function(t){
+      t <- t %>%
+        filter(intensity>0) %>%
+        arrange(intensity) %>%
+        mutate(order = seq(nrow(.)))
+      p75 <- t %>%
+        pull(intensity) %>% 
+        quantile(0.75)
+      u <- t %>%
+        filter(intensity < p75)
+      if(nrow(u)>3){
+        mdl <- rlm(data = u, log10(intensity) ~ order)
+        t_filt<- t %>% 
+          mutate(pred = predict(mdl, t)) %>%
+          mutate(res = abs(pred - log10(intensity))) %>%
+          filter(res > sd(residuals(mdl))*3) %>%
+          arrange(mz)
+        if (nrow(t_filt) > 0) {
+          t<- t_filt
+        } else {
+          t<- t %>% arrange(mz)
+        }
+      } else {
+        return(t %>% arrange(mz))  # Not enough points to model
+      }
+    }))
+  ms2_cl <- ms2_tb %>%
+    mutate(
+      mz = map(ms2_RLM, ~ .x$mz),
+      intensity = map(ms2_RLM, ~ .x$intensity)
+    ) %>%
+    filter(map_lgl(mz, ~ length(.x) > 0)) %>%
+    as.data.frame() %>%
+    Spectra()
+  return(ms2_cl)
+}
+```
+
+#POSITIVE XCMS
+
+loading files 
+using only DDA data, also for peak peaking, with metadata
+
+```{r}
+pth <- file.path( "alternaria_data/pos/data/mzML")
+fls <- list.files(pth, pattern = "mzML", full.names = TRUE)
+fls <- fls[!grepl("blank|MED|MEDW", fls, ignore.case = TRUE)]
+fls <- fls[grep("DDA", fls)]
+```
+
+peak piking 
+ 
+```{r}
+mse <- readMsExperiment(spectraFiles = fls)
+
+#filter wrong spectra
+idx <- which(round(spectra(mse)$precursorMz) != round(spectra(mse)$isolationWindowTargetMz) & spectra(mse)$msLevel==2)
+filterByIndex <- function(x, index) { x[index] }
+filterSpectra(mse, filterByIndex, -idx)
+
+cwp<- CentWaveParam(ppm = 10,
+                    peakwidth = c(3, 10),
+                     prefilter = c(5, 1000000),
+                     noise = 50000)
+data <- findChromPeaks(mse, param = cwp) 
+```
+ 
+ features creation
+ 
+```{r}
+#' Peak refinement
+mnp <- MergeNeighboringPeaksParam(expandRt = 2, expandMz = 0.001,
+                                  minProp = 3/4)
+data <- refineChromPeaks(data, param = mnp)
+#' Alignment
+sampleData(data)$highRes <- TRUE
+pdp1 <- PeakDensityParam(sampleGroups = sampleData(data)$highRes, bw = 2,
+                         minFraction = 0.8, binSize = 0.01)
+data <- groupChromPeaks(data, param = pdp1)
+pgp <- PeakGroupsParam(minFraction = 0.8, extraPeaks = 100, span = 0.8)
+data <- adjustRtime(data, param = pgp)
+#' Correspondence analysis
+pdp2 <- PeakDensityParam(sampleGroups =sampleData(data)$highRes, bw = 2,
+                         minFraction = 0.3, binSize = 0.01) 
+data <- groupChromPeaks(data, param = pdp2)
+#' Gap-filling
+data <- fillChromPeaks(data, param = ChromPeakAreaParam())
+ftvalues <-data.frame(featureValues(data, value = "into", method="sum"))
+ftdetec <- data.frame(featureDefinitions(data))
+ftvalues <- ftvalues[rownames(ftvalues) %in% rownames(ftdetec),]
+ftdetec$meanval <- colMeans(t(ftvalues), na.rm = TRUE)
+
+```
+ 
+searching for msms related to each features
+ 
+```{r}
+ms2_spectra <- featureSpectra(data, expandRt = 0, return.type = "Spectra",
+                              method ="largest_bpi",
+                              ppm = 5, 
+                              featureColumns = c("mzmed", "rtmed", "rtmin", "rtmax"))
+ms2_allspectra_pos <- featureSpectra(data, expandRt = 0, return.type = "Spectra",
+                              ppm = 5, 
+                              featureColumns = c("mzmed", "rtmed", "rtmin", "rtmax"))
+
+ms2_spectra$id <- paste0(basename(ms2_spectra$dataOrigin), ms2_spectra$scanIndex)
+
+#features with at leat one fragmentation spectra
+features <- unique(spectraData(ms2_spectra)$feature_id)
+
+```
+
+selecting one ms2 for each feature, selecting the one with highest base peak intensity
+
+```{r}
+
+sp <- split(spectraData(ms2_spectra), spectraData(ms2_spectra)$feature_id)
+
+cp <- vapply(sp, function(x){
+    x$chrom_peak_id[which.max(x$basePeakIntensity)]
+}, character(1))
+ms2_spectra <- ms2_spectra[which(spectraData(ms2_spectra)$chrom_peak_id %in% cp)]
+
+#Noise cleaning
+ms2_spectra <- cleaning_ref(ms2_spectra)
+
+spspos<- ms2_spectra
+ftdetec$name <- rownames(ftdetec)
+ftpos <- ftdetec[which(ftdetec$name %in% spspos$feature_id),]
+length(spspos)
+nrow(ftpos)
+```
+
+#NEGATIVE XCMS
+
+loading files 
+using only DDA data, also for peak peaking
+
+```{r}
+pth <- file.path( "alternaria_data/neg/data/mzML")
+fls <- list.files(pth, pattern = "mzML", full.names = TRUE)
+fls <- fls[!grepl("blank|MED|MEDW", fls, ignore.case = TRUE)]
+fls <- fls[grep("DDA", fls)]
+```
+
+peak piking 
+ 
+```{r}
+mse <- readMsExperiment(spectraFiles = fls)
+
+#filter wrong spectra
+idx <- which(round(spectra(mse)$precursorMz) != round(spectra(mse)$isolationWindowTargetMz) & spectra(mse)$msLevel==2)
+filterByIndex <- function(x, index) { x[index] }
+filterSpectra(mse, filterByIndex, -idx)
+
+cwp<- CentWaveParam(ppm = 10,
+                    peakwidth = c(3, 10),
+                     prefilter = c(5, 500000),
+                     noise = 50000)
+data <- findChromPeaks(mse, param = cwp) 
+```
+ 
+ features creation
+ 
+```{r}
+#' Peak refinement
+mnp <- MergeNeighboringPeaksParam(expandRt = 2, expandMz = 0.001,
+                                  minProp = 3/4)
+data <- refineChromPeaks(data, param = mnp)
+#' Alignment
+sampleData(data)$highRes <- TRUE
+pdp1 <- PeakDensityParam(sampleGroups = sampleData(data)$highRes, bw = 2,
+                         minFraction = 0.8, binSize = 0.01)
+data <- groupChromPeaks(data, param = pdp1)
+pgp <- PeakGroupsParam(minFraction = 0.8, extraPeaks = 100, span = 0.8)
+data <- adjustRtime(data, param = pgp)
+#' Correspondence analysis
+pdp2 <- PeakDensityParam(sampleGroups =sampleData(data)$highRes, bw = 2,
+                         minFraction = 0.3, binSize = 0.01) 
+data <- groupChromPeaks(data, param = pdp2)
+#' Gap-filling
+data <- fillChromPeaks(data, param = ChromPeakAreaParam())
+ftvalues <-data.frame(featureValues(data, value = "into", method="sum"))
+ftdetec <- data.frame(featureDefinitions(data))
+ftvalues <- ftvalues[rownames(ftvalues) %in% rownames(ftdetec),]
+ftdetec$meanval <- colMeans(t(ftvalues), na.rm = TRUE)
+```
+
+
+searching for msms realted to each features
+ 
+```{r}
+ms2_spectra <- featureSpectra(data, expandRt = 0, return.type = "Spectra",
+                              method ="largest_bpi",
+                              ppm = 5, 
+                              featureColumns = c("mzmed", "rtmed", "rtmin", "rtmax"))
+
+ms2_allspectra_neg <- featureSpectra(data, expandRt = 0, return.type = "Spectra",
+                              ppm = 5, 
+                              featureColumns = c("mzmed", "rtmed", "rtmin", "rtmax"))
+
+
+ms2_spectra$id <- paste0(basename(ms2_spectra$dataOrigin), ms2_spectra$scanIndex)
+
+#features with at leat one fragmentation spectra
+features <- unique(spectraData(ms2_spectra)$feature_id)
+
+```
+ 
+ selecting one msms for each features
+ 
+```{r}
+sp <- split(spectraData(ms2_spectra), spectraData(ms2_spectra)$feature_id)
+
+cp <- vapply(sp, function(x){
+    x$chrom_peak_id[which.max(x$basePeakIntensity)]
+}, character(1))
+ms2_spectra <- ms2_spectra[which(spectraData(ms2_spectra)$chrom_peak_id %in% cp)]
+
+#Noise cleaning
+ms2_spectra <- cleaning_ref(ms2_spectra)
+
+spsneg<- ms2_spectra
+ftdetec$name <- rownames(ftdetec)
+ftneg <- ftdetec[which(ftdetec$name %in% spsneg$feature_id),]
+length(spsneg)
+nrow(ftneg)
+
+```
+
+#NEUTRAL
+
+```{r}
+ftpos <- ftpos %>%
+  filter(rtmed>30&rtmed<600)
+ftpos<- ftpos%>%
+  filter(log10(meanval)>6)
+
+ftneg <- ftneg %>%
+  filter(rtmed>30&rtmed<600)
+ftneg <- ftneg %>%
+  filter(log10(meanval)>6)
+
+#create a table with correct mass
+ftpos$neutralmass <- ftpos$mzmed - 1.00728
+ftneg$neutralmass <- ftneg$mzmed + 1.00728
+```
+
+selecting only common ft between positive and negative ionization, match for rt and mz 
+
+```{r}
+
+ftpos <- as.data.frame(ftpos)
+ftneg <- as.data.frame(ftneg)
+ft_match <- matchValues(
+  ftneg, ftpos, param = MzRtParam(ppm = 5, toleranceRt = 5),
+  mzColname = c("neutralmass", "neutralmass"),
+  rtColname  = c("rtmed", "rtmed")  
+  )
+tb_match <- matchedData(ft_match)
+tb_match <- tb_match[!is.na(tb_match$target_mzmed),]
+tb_match <- tb_match[!grepl("\\.", rownames(tb_match)), ]  #delete double matches
+tb_match <- as.data.frame(tb_match)
+tb_match <- tb_match %>%
+  distinct(target_name, .keep_all = TRUE)
+tb_match$n_mass <- (tb_match$neutralmass+tb_match$target_neutralmass)/2
+comonft <- tb_match %>%
+  dplyr::select(all_of(c("rtmed", "n_mass", "meanval")))
+comonft$name_p <- tb_match$target_name
+comonft$name_n <- tb_match$name
+```
+
+selecting MS2 of fature used for NMN
+
+```{r warning=FALSE}
+MS2pos <- spspos[which(spspos$feature_id %in% comonft$name_p)]
+MS2neg <- spsneg[which(spsneg$feature_id %in% comonft$name_n)]
+
+length(MS2neg)
+length(MS2pos)
+```
+
+single spectra for negative and positive
+
+```{r warning=FALSE}
+process_data <- function(data) {
+  data <- data %>%
+    arrange(mz) %>%
+    mutate(group = cumsum(c(TRUE, diff(mz) >= 0.0005))) %>%
+    group_by(group) %>%
+    summarise(
+      mz = mean(mz),
+      intensity = mean(intensity)
+    ) %>%
+    ungroup() %>%
+    dplyr::select(-group)
+  return(data)
+} 
+
+comonft$spectrum <- NA
+neutral_spectra <- Spectra()
+
+
+for(i in 1:nrow(comonft)){
+  register(SerialParam())
+  #positive
+  fl <- MS2pos
+  akap <- fl[i]
+    if(length(akap)>0){
+    mzpos <- mz(akap)[[1]] 
+    mzpos <- mzpos - 1.00728
+    intpos <- intensity(akap)[[1]]
+    intpos <- (intpos/max(intpos))*100
+    df_pos <- data.frame(mz = mzpos, intensity = intpos)
+    #negative
+    fl <- MS2neg
+    neg_name <- comonft$name_n[which(comonft$name_p==akap$feature_id)]
+    akan <- fl[which(fl$feature_id==neg_name)]
+        if(length(akan)>0){
+      mzneg <- mz(akan)[[1]] 
+      mzneg <- mzneg + 1.00728
+      intneg <- intensity(akan)[[1]]
+      intneg <- (intneg/max(intneg))*100
+      df_neg <- data.frame(mz = mzneg, intensity = intneg) 
+          
+      #both
+      df <- bind_rows(df_neg, df_pos) %>%
+        arrange(mz)
+      df<- as.data.frame(process_data(df))
+      totmz<- as.numeric(df$mz)
+      totint <- as.numeric(df$intensity)
+      
+      prec<- mean(c(precursorMz(akan),precursorMz(akap)))
+      
+      spectrum<- data.frame(
+        id= akap$feature_id,
+        mz = I(list(totmz)),
+        intensity = I(list(totint)),
+        precursorMz=prec
+      )
+      sps <- Spectra(spectrum)
+      neutral_spectra <- c(neutral_spectra, sps)
+    }
+  }
+  print(i)
+}
+
+```
+
+#modualrity mesurements 
+
+global and local modularity for the toxin-related isomers across different similarity threshold (from 0 to 1)
+The mesurements where repeated multiple times (25) in order to consider variability. For each repetition, a MS/MS spectra for each feature where randomly chose within feature related spectra. 
+first we identify our subset of features that are representing the same compound (isomers)
+
+```{r}
+#manual identification 
+toxp <- "FT1776"
+toxn <- "FT1104"
+isop <- c("FT1775","FT1777")
+ison <- c("FT1103","FT1105")
+#identification of dehydratation of toxin isomers
+sub<- comonft[which(MsCoreUtils::between(comonft$rtmed, c(4*60,4.5*60))),]
+sub<- sub[which(MsCoreUtils::between(sub$n_mass, 264.1360+0.0005*c(-1,1))),]
+allisop <- c(isop, sub$name_p, toxp)
+allison <- c(ison, sub$name_n, toxn)
+```
+
+define the function for local modularity calculation
+
+```{r}
+LQ <- function(graph, allisop){
+  sel_nodes <- V(graph)[name %in% allisop]
+#identify my cluster (toxin isomers)
+sub <- induced_subgraph(graph, vids = allisop)
+#edges within my cluster
+Li<- sum(E(sub)$weight)
+#edges with neighbour and within my cluster
+vicini<- unique(unlist(neighborhood(graph, order = 1, nodes = allisop)))
+local_subgraph <- induced_subgraph(graph, vids = vicini)
+L_N <- sum(E(local_subgraph)$weight)
+#edges external to my cluster
+df1<- as_data_frame(local_subgraph, what="edges") %>%
+  filter(from %in% allisop |to %in% allisop)
+df2<- as_data_frame(local_subgraph, what="edges") %>%
+  filter(from %in% allisop &to %in% allisop)
+df <- anti_join(df1, df2, by = c("from", "to"))
+
+L_out <- sum(df$weight)
+
+LQ <- (Li / L_N) - ((Li * L_out) / (L_N^2))
+
+return(LQ)
+}
+```
+
+calualtion of mosularities across similarity thresholds
+
+```{r}
+ms2_spectra_neg<- ms2_allspectra_neg    #all negative MS/MS
+ms2_spectra_pos <- ms2_allspectra_pos    #all positive MS/MS
+#giving an id for changing spectra within a feature
+ms2_spectra_neg$idf <- paste0(ms2_spectra_neg$scanIndex, basename(ms2_spectra_neg$dataOrigin))
+ms2_spectra_neg<- ms2_spectra_neg[!duplicated(ms2_spectra_neg$idf)]
+ms2_spectra_pos$idf <- paste0(ms2_spectra_pos$scanIndex, basename(ms2_spectra_pos$dataOrigin))
+ms2_spectra_pos<- ms2_spectra_pos[!duplicated(ms2_spectra_pos$idf)]
+
+metadata_neg <- as.data.frame(spectraData(ms2_spectra_neg))
+metadata_pos <- as.data.frame(spectraData(ms2_spectra_pos))
+
+valtab <- data.frame(rep=1:25)
+valtab$data <- vector(mode="list", length=nrow(valtab))
+valtab$LQ <- vector(mode="list", length=nrow(valtab))
+
+#loop for differnet validation
+
+for(w in 1:nrow(valtab)){
+#selecting neg sps
+  tmpneg<- Spectra()
+unique_features <- metadata_neg %>%
+  group_by(feature_id) %>%
+  slice_sample(n = 1) %>%
+  ungroup() %>%
+  filter(feature_id %in% MS2neg$feature_id)
+tmpneg <- ms2_spectra_neg[match(unique_features$idf, ms2_spectra_neg$idf)]
+tmpneg$id<- tmpneg$feature_id
+#selecting pos sps
+tmppos<- Spectra()
+unique_features <- metadata_pos %>%
+  group_by(feature_id) %>%
+  slice_sample(n = 1) %>%
+  ungroup() %>%
+  filter(feature_id %in% MS2pos$feature_id)
+tmppos <- ms2_spectra_pos[match(unique_features$idf, ms2_spectra_pos$idf)]
+tmppos$id <- tmppos$feature_id
+#making neutral
+tmpneu <- Spectra()
+for(i in 1:nrow(comonft)){
+  register(SerialParam())
+  #positive
+  fl <- tmppos
+  akap <- fl[which(fl$feature_id==comonft$name_p[i])]
+  if(length(akap)>0){
+    mzpos <- mz(akap)[[1]] - 1.00728
+    intpos <- intensity(akap)[[1]]
+    intpos <- (intpos/max(intpos))*100
+    df_pos <- data.frame(mz = mzpos, intensity = intpos)
+    #negative
+    fl <- tmpneg
+    akan <- fl[which(fl$feature_id==comonft$name_n[i])]
+    if(length(akan)>0){
+      mzneg <- mz(akan)[[1]] + 1.00728
+      intneg <- intensity(akan)[[1]]
+      intneg <- (intneg/max(intneg))*100
+      df_neg <- data.frame(mz = mzneg, intensity = intneg) 
+      
+      #both
+      df <- bind_rows(df_neg, df_pos) %>%
+        arrange(mz)
+      df<- as.data.frame(process_data(df))
+      totmz<- as.numeric(df$mz)
+      totint <- as.numeric(df$intensity)
+      
+      prec<- max(c(precursorMz(akan),precursorMz(akap)))
+      precint<- mean(precursorIntensity(akap)+precursorIntensity(akan))
+      
+      spectrum<- data.frame(
+        id= comonft$name_p[i],
+        mz = I(list(totmz)),
+        intensity = I(list(totint)),
+        precursorMz=prec,
+        precursorIntensity=precint,
+        rtime <- comonft$rtmed[i]
+      )
+      spectrum <- Spectra(spectrum)
+      tmpneu <- c(tmpneu, spectrum)
+    }
+  }
+}
+register(MulticoreParam(detectCores() - 1))  
+#create matrices
+mat_neu <- compareSpectra(tmpneu, MAPFUN = joinPeaksGnps, tolerance = 0.01, FUN = MsCoreUtils::gnps, BPPARAM = MulticoreParam())
+mat_neg <- compareSpectra(tmpneg, MAPFUN = joinPeaksGnps, tolerance = 0.01, FUN = MsCoreUtils::gnps, BPPARAM = MulticoreParam())
+mat_pos <- compareSpectra(tmppos, MAPFUN = joinPeaksGnps, tolerance = 0.01, FUN = MsCoreUtils::gnps, BPPARAM = MulticoreParam())
+
+seq <- seq(0,1,0.05)  #simialrity threshold for the mesurements
+
+#df for global modualrity
+mod_thr <- data.frame(n=seq,   
+                      neu=NA,
+                      pos=NA,
+                      neg=NA)
+#df for local modularity 
+LQ_thr <- data.frame(n=seq,
+                     neu=NA,
+                     pos=NA,
+                     neg=NA)
+
+#nodes to consider
+all_nodes <- data.frame(
+  id = neutral_spectra$id
+)
+all_nodes_p <- data.frame(
+  id = MS2pos$feature_id
+)
+all_nodes_n <- data.frame(
+  id = MS2neg$feature_id
+)
+
+#making MNs an calculate modularity and LQ for toxin isomers
+
+for(i in 1:length(seq)){
+  thr <- seq[i]
+  #neu
+  edges<- create_edge_list(mat_neu, thr, tmpneu)
+  gneu <- graph_from_data_frame(d = edges, vertices = all_nodes, directed = FALSE)
+  V(gneu)$iso<- NA
+  V(gneu)$iso[which(V(gneu)$name%in% allisop)]<- "toxin"
+  V(gneu)$community <- ifelse(V(gneu)$name %in% allisop, 1, 2)
+  mod_thr$neu[i]<- modularity(gneu, membership = V(gneu)$community)
+  LQ_thr$neu[i]<- LQ(gneu, allisop)
+  #pos
+  edges<- create_edge_list(mat_pos, thr, tmppos)
+  gpos <- graph_from_data_frame(d = edges, vertices = all_nodes_p, directed = FALSE)
+  V(gpos)$iso<- NA
+  V(gpos)$iso[which(V(gpos)$name%in%allisop)]<- "toxin"
+  V(gpos)$community <- ifelse(V(gpos)$name %in% allisop, 1, 2)
+  mod_thr$pos[i]<-modularity(gpos, membership = V(gpos)$community)
+  LQ_thr$pos[i]<- LQ(gpos, allisop)
+  #neg
+  edges<- create_edge_list(mat_neg, thr, tmpneg)
+  gneg <- graph_from_data_frame(d = edges, vertices = all_nodes_n, directed = FALSE)
+  V(gneg)$iso<- NA
+  V(gneg)$iso[which(V(gneg)$name%in%allison)]<- "toxin"
+  V(gneg)$community <- ifelse(V(gneg)$name %in% allison, 1, 2)
+  mod_thr$neg[i]<- modularity(gneg, membership = V(gneg)$community)
+  LQ_thr$neg[i]<- LQ(gneg, allison)
+}
+valtab$data[[w]] <-mod_thr
+valtab$LQ[[w]] <-LQ_thr
+print(w)
+}
+
+```
+
+
+
+
