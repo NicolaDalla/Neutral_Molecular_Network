@@ -409,32 +409,35 @@ allison <- c(ison, sub$name_n, toxn)
 define the function for local modularity calculation
 
 ```{r}
-LQ <- function(graph, allisop){
-  sel_nodes <- V(graph)[name %in% allisop]
-#identify my cluster (toxin isomers)
-sub <- induced_subgraph(graph, vids = allisop)
-#edges within my cluster
-Li<- sum(E(sub)$weight)
-#edges with neighbour and within my cluster
-vicini<- unique(unlist(neighborhood(graph, order = 1, nodes = allisop)))
-local_subgraph <- induced_subgraph(graph, vids = vicini)
-L_N <- sum(E(local_subgraph)$weight)
-#edges external to my cluster
-df1<- as_data_frame(local_subgraph, what="edges") %>%
-  filter(from %in% allisop |to %in% allisop)
-df2<- as_data_frame(local_subgraph, what="edges") %>%
-  filter(from %in% allisop &to %in% allisop)
-df <- anti_join(df1, df2, by = c("from", "to"))
-
-L_out <- sum(df$weight)
-
-LQ <- (Li / L_N) - ((Li * L_out) / (L_N^2))
-
-return(LQ)
+LQ <- function(graph, allisop) {
+  
+  # Ensure subgroup nodes exist
+  allisop <- intersect(allisop, V(graph)$name)
+  if (length(allisop) == 0) stop("No subgroup nodes found in the graph.")
+  
+  # Subgraph of the subgroup
+  sub <- induced_subgraph(graph, vids = allisop)
+  
+  # Total weight of edges inside the subgroup
+  Li <- sum(E(sub)$weight)
+  
+  # Identify 1-hop neighbors of subgroup
+  vicini <- unique(unlist(neighborhood(graph, order = 1, nodes = allisop)))
+  
+  # Local subgraph: subgroup + neighbors
+  local_subgraph <- induced_subgraph(graph, vids = vicini)
+  
+  # Total weight of edges in local subgraph
+  L_N <- sum(E(local_subgraph)$weight)
+  
+  # Local modularity
+  LQ_value <- Li / L_N
+  
+  return(LQ_value)
 }
 ```
 
-calualtion of mosularities across similarity thresholds
+calualtion of modularities across similarity thresholds, different validation considering differnt fragemntation spectra for each feature
 
 ```{r}
 ms2_spectra_neg<- ms2_allspectra_neg    #all negative MS/MS
@@ -582,6 +585,7 @@ print(w)
 }
 
 ```
+
 
 
 
