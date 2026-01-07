@@ -191,39 +191,7 @@ summary_res <- all_res %>%
 
 ```
 
-considerign p-value to asses the significance of the difference between neutral NM and the best single polaorty MN for each number of considederd neighbour.
 
-```{r}
-all_res <- gigatab %>%
-  mutate(rep_id = row_number()) %>%
-  dplyr::select(rep_id, data) %>%
-  tidyr::unnest(data) %>%
-  dplyr::select(rep_id, n, neu, pos, neg)
-
-# Function: for each n, choose best of pos/neg and test vs neutral
-pvals <- all_res %>%
-  group_by(n) %>%
-  group_modify(~ {
-    df <- .x
-    
-    # Find which of pos/neg has higher mean
-    mean_pos <- mean(df$pos, na.rm=TRUE)
-    mean_neg <- mean(df$neg, na.rm=TRUE)
-    best_col <- if (mean_pos > mean_neg) "pos" else "neg"
-    
-    # Paired t-test: neutral vs best
-    test <- t.test(df$neu, df[[best_col]], paired=TRUE)
-    
-    tibble(
-      best_method = best_col,
-      mean_neu = mean(df$neu, na.rm=TRUE),
-      mean_best = mean(df[[best_col]], na.rm=TRUE),
-      p_value = test$p.value
-    )
-  }) %>%
-  ungroup()
-
-```
 
 
 
