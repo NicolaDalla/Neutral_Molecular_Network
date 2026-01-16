@@ -310,19 +310,23 @@ comonft$name_p <- tb_match$target_name
 comonft$name_n <- tb_match$name
 ```
 
-selecting MS2 of fature used for NMN
+selecting MS2 of fature used for NMN and single-polarity MNs
 
 ```{r warning=FALSE}
 MS2pos <- spspos[which(spspos$feature_id %in% comonft$name_p)]
 MS2neg <- spsneg[which(spsneg$feature_id %in% comonft$name_n)]
 
+MS2neg <- filterPrecursorPeaks(MS2neg, ppm = 50, mz = ">=")
+MS2pos <- filterPrecursorPeaks(MS2pos, ppm = 50, mz = ">=")
+
 length(MS2neg)
 length(MS2pos)
 ```
 
-single spectra for negative and positive
+creation of neutral pseudo-spectra from single spectra of negative and positive ESI
 
 ```{r warning=FALSE}
+#function to merge the ions with similar m/z values after the mass "aligment"
 process_data <- function(data) {
   data <- data %>%
     arrange(mz) %>%
@@ -340,7 +344,7 @@ process_data <- function(data) {
 comonft$spectrum <- NA
 neutral_spectra <- Spectra()
 
-
+#creation of neutral pseudo-spectra
 for(i in 1:nrow(comonft)){
   register(SerialParam())
   #positive
@@ -585,6 +589,7 @@ print(w)
 }
 
 ```
+
 
 
 
