@@ -1,0 +1,149 @@
+#function to plot neutral_pseudo spectra startinmg fro cololred according to the oringinm "feature_id" variable
+#spectral will be colored according to the origin (positive, negative, both)
+
+plot_mirror_gg <- function(ms2, i, j, tol = 0.001){ 
+  a <- ms2[i] 
+  b <- ms2[j] 
+  sps_i <- data.frame( mz = Spectra::mz(a)[[1]], int = Spectra::intensity(a)[[1]] ) |> 
+    mutate( irel = int / max(int), nl = ms2$precursorMz[i] - mz, spec = "top" ) 
+  sps_j <- data.frame( mz = Spectra::mz(b)[[1]], int = Spectra::intensity(b)[[1]] ) |>
+    mutate( irel = -(int / max(int)), nl = ms2$precursorMz[j] - mz, spec = "bottom" ) # Peak matching 
+  jo_d <- MsCoreUtils::join(sps_i$mz, sps_j$mz, tolerance = tol) 
+  jo_g <- MsCoreUtils::join_gnps( sps_i$mz, sps_j$mz, ms2$precursorMz[i], ms2$precursorMz[j], tolerance = tol ) 
+  idx_d_i <- jo_d$x[complete.cases(jo_d)] 
+  idx_d_j <- jo_d$y[complete.cases(jo_d)] 
+  idx_g_i <- setdiff(jo_g$x[complete.cases(jo_g)], idx_d_i) 
+  idx_g_j <- setdiff(jo_g$y[complete.cases(jo_g)], idx_d_j) 
+  sps_i$type <- "unmatched" 
+  sps_j$type <- "unmatched" 
+  sps_i$type[idx_d_i] <- "direct" 
+  sps_j$type[idx_d_j] <- "direct" 
+  sps_i$type[idx_g_i] <- "neutral_loss" 
+  sps_j$type[idx_g_j] <- "neutral_loss" 
+  
+  df <- bind_rows(sps_i, sps_j) 
+  sim <- compareSpectra(c(a,b), MAPFUN = joinPeaksGnps, tolerance = tol, FUN = MsCoreUtils::gnps)[1,2] 
+  
+  #origin of ions
+  tol <- 0.001
+  sb<- df%>%
+    dplyr::select(mz, spec)
+
+  # Feature A (top)
+  pida <- a$feature_id
+  nida <- comonft$name_n[which(comonft$name_p==pida)]
+  mza_pos <- mz(MS2pos[MS2pos$feature_id == pida])[[1]]
+  mza_neg <- mz(MS2neg[MS2neg$feature_id == nida])[[1]]
+  
+  # Feature B (bottom)
+  pidb <- b$feature_id
+  nidb <- comonft$name_n[which(comonft$name_p==pidb)]
+  mzb_pos <- mz(MS2pos[MS2pos$feature_id == pidb])[[1]]
+  mzb_neg <- mz(MS2neg[MS2neg$feature_id == nidb])[[1]]
+  
+  # --- MATCHING LOGIC ---
+  sb$pos[sb$spec == "top"] <- sapply(sb$mz[sb$spec == "top"], function(x) {
+    any(abs(x - (mza_pos-1.00728)) < tol)
+  })
+  sb$neg[sb$spec == "top"] <- sapply(sb$mz[sb$spec == "top"], function(x) {
+    any(abs(x - (mza_neg+1.00728)) < tol)
+  })
+
+  sb$pos[sb$spec == "bottom"] <- sapply(sb$mz[sb$spec == "bottom"], function(x) {
+    any(abs(x - (mzb_pos-1.00728)) < tol)
+  })
+  sb$neg[sb$spec == "bottom"] <- sapply(sb$mz[sb$spec == "bottom"], function(x) {
+    any(abs(x - (mzb_neg+1.00728)) < tol)
+  })
+  
+  # 3. Define the final Origin
+  sb <- sb %>%
+    mutate(
+      both = pos & neg,
+      origin = case_when(
+        both ~ "Both",
+        pos  ~ "Positive",
+        neg  ~ "Negative",
+        TRUE ~ "Unknown"
+      )
+    )
+  df$origin <- sb$origin
+  
+  df <- df %>%
+    mutate(
+      color = case_when(
+        type == "unmatched" ~ "unmatched",
+        origin == "Both"     ~ "both",
+        origin == "Positive" ~ "positive",
+        origin == "Negative" ~ "negative",
+        TRUE                 ~ "unknown"
+      )
+    ) %>%
+    mutate(match=ifelse(type=="unmatched", FALSE, TRUE))
+  
+  # ---- TOP spectrum: label top 4  ----
+  df<- df%>%
+    mutate(
+      # Corrected Label Logic
+      label = as.character(sprintf("%.4f", mz)),
+      # Vertical adjustment: Positive irel goes up, Negative irel goes down
+      vjust = ifelse(irel > 0, -1, 1.4),
+      label_color = ifelse(color == "unmatched", "black", df$color)
+    )
+  
+  #df$label[df$type=="neutral_loss"] <- paste0(df$label[df$type=="neutral_loss"],"*")
+
+
+  ggplot(df, aes(x = mz, y = irel, color = origin)) + 
+    geom_segment( aes(xend = mz, yend = 0), linewidth = 0.7 ) + 
+    geom_hline(yintercept = 0, color = "black", linetype="dashed") + 
+    scale_color_manual(
+      name = "Ion Origin",
+      values = c(
+        "Positive"  = "#D81B60", # Magenta/Red
+        "Negative"  = "#1E88E5", # Blue
+        "Both"      = "#4DAF4A", # Green
+        "Unmatched" = "grey65"
+      )
+    ) +
+#Add stars (asterisks) at the tip of matched peaks
+    geom_point(
+      data = df %>% filter(match==TRUE), 
+      aes(x = mz, y = irel, color = origin), 
+      size = 2,           # Size of the dot
+      show.legend = FALSE
+    ) +
+    # direct m/z labels
+    geom_text(
+      data = df %>% filter(abs(int) > 23 ),
+      aes(label = label, vjust = vjust, color=origin),
+      size = 3.5,
+      show.legend = FALSE
+    )  +
+    scale_y_continuous( limits = c(-1.1, 1.1), breaks = seq(-1, 1, 0.5), labels = abs ) + 
+    #scale_x_continuous(limits = c(50, 280))+
+    labs( x = "m/z", y = "Realtive Intensity" ,
+          title=paste0("Top - M:", round(precursorMz(a),4), " | RT:", round(rtime(a)/60,2),"\n",
+                       "Bottom - M:", round(precursorMz(b),4), " | RT:", round(rtime(b)/60,2)))+
+    theme_classic(base_size = 12) + 
+    theme(
+      legend.position = "bottom", 
+      plot.title = element_text(size=12,face = "bold"),
+      axis.line = element_line(linewidth = 0.6),
+      legend.title = element_text(size = 10, face = "bold")
+    ) +
+    # Make legend points bigger so they are visible
+    guides(color = guide_legend(override.aes = list(linewidth = 1)))
+}
+
+#application of the function
+
+msms <- applyProcessing(neutral_msms)
+
+ft1 <- "FT11038"
+ft2<-  "FT11574"
+i<- which(msms$feature_id==ft1)
+j<- which(msms$feature_id==ft2)
+
+xp<- plot_mirror_gg(msms,i,j,0.001)
+xp
