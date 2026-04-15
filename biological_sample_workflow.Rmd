@@ -3,42 +3,38 @@ title: "merging_poneg"
 output: html_document
 date: "2024-06-27"
 ---
-
 ```{r}
 library(xcms)
-library(effectsize)
 library(dplyr)
 library(tidyr)
 library(purrr)
-library(rlang)
 library(MsCoreUtils)
 library(Spectra)
 library(MsBackendMgf)
-library(readr)
-library(stringr)
 library(MetaboCoreUtils)
 library(igraph)
 library(visNetwork)
 library(MsExperiment)
 library(RuSirius)
-library(stats)
 library(MetaboAnnotation)
 library(RColorBrewer)
 library(MASS)
+library(MsFeatures)
+library(ggplot2)
+
 
 cleaning_ref<- function(ms2){
   ms2_tb <- as.data.frame(
     spectraData(ms2) 
   ) %>%
-    mutate( ms2_raw = mapply(cbind, mz(ms2), intensity(ms2), SIMPLIFY = FALSE)) %>%
-    mutate(ms2_raw = map(ms2_raw, function(t){
-      colnames(t) <- c("mz", "intensity")
-      t %>%
-        as.data.frame() %>%
-        mutate(mz = as.numeric(mz)) %>%
-        mutate(intensity = as.numeric(intensity))
-    })) %>%
-    mutate(ms2_RLM = map(ms2_raw, function(t){
+  mutate(ms2_raw = map2(mz(ms2), intensity(ms2), ~{
+    if (length(.x) == 0 || length(.y) == 0)
+      return(data.frame(mz = numeric(0), intensity = numeric(0)))
+    data.frame(mz = as.numeric(.x), intensity = as.numeric(.y))
+  })) %>%
+    mutate(ms2_RLM = purrr::map(ms2_raw, function(t){
+         if (is.null(t) || nrow(t) == 0 || !"intensity" %in% names(t))
+        return(tibble(mz = numeric(0), intensity = numeric(0)))
       t <- t %>%
         filter(intensity>0) %>%
         arrange(intensity) %>%
@@ -66,8 +62,8 @@ cleaning_ref<- function(ms2){
     }))
   ms2_cl <- ms2_tb %>%
     mutate(
-      mz = map(ms2_RLM, ~ .x$mz),
-      intensity = map(ms2_RLM, ~ .x$intensity)
+      mz = purrr::map(ms2_RLM, ~ .x$mz),
+      intensity = purrr::map(ms2_RLM, ~ .x$intensity)
     ) %>%
     filter(map_lgl(mz, ~ length(.x) > 0)) %>%
     as.data.frame() %>%
@@ -76,522 +72,985 @@ cleaning_ref<- function(ms2){
 }
 ```
 
-#POSITIVE XCMS
-
-loading files 
-using only DDA data, also for peak peaking, with metadata
+setting parameters of RTs and mz tolerance
 
 ```{r}
-pth <- file.path( "alternaria_data/pos/data/mzML")
-fls <- list.files(pth, pattern = "mzML", full.names = TRUE)
-fls <- fls[!grepl("blank|MED|MEDW", fls, ignore.case = TRUE)]
-fls <- fls[grep("DDA", fls)]
+rt_lim1 <- 30
+rt_lim2 <- 600
+tol<- 0.005 #for adducts/isopoes matching
+```
+we assume to have done xcms processing, which have lead to "fdata" creation for each polarities, whihc is an XCMSexperiment object created after feature creation and alignment.
+First we create chromatographic groups of features, then we identify adduct within each group. [M+H]+ and [M-H]- species will be used for pairing across polarities and for neutral pseudo-spectra creation.
+
+#GROUPING POSITIVE ESI
+
+GROUPING
+
+creating feature group according to rtime, correlation between sample and peak shape correlation 
+
+```{r}
+load("rdata/alt_pos_xcms.RData")
+
+sb<- filterRt(fdata, rt=c(rt_lim1, rt_lim2))
+
+#grouping for rtime
+grdata1 <- groupFeatures(sb, param = SimilarRtimeParam(5, groupFun =groupConsecutive))
+plotFeatureGroups(grdata1, pch = 21, lwd = 2, col = "#00000040", bg = "#00000020")
+#for coorelation across samples
+grdata2 <- groupFeatures(
+    grdata1, AbundanceSimilarityParam(threshold  = 0.7, transform = log2,
+                                      subset=grep("A", sampleData(grdata1)$sample)),
+    filled = TRUE)
+plotFeatureGroups(grdata2, pch = 21, lwd = 2, col = "#00000040", bg = "#00000020")
+#for peak shape
+grdata3 <- groupFeatures(grdata2, EicSimilarityParam(threshold = 0.7, n = 3))
+plotFeatureGroups(grdata3, pch = 21, lwd = 2, col = "#00000040", bg = "#00000020")
 ```
 
-peak piking 
- 
+adduct recognition for each chromatographic group
+
 ```{r}
-mse <- readMsExperiment(spectraFiles = fls)
+#extracting an filtering feature table
 
-#filter wrong spectra
-idx <- which(round(spectra(mse)$precursorMz) != round(spectra(mse)$isolationWindowTargetMz) & spectra(mse)$msLevel==2)
-filterByIndex <- function(x, index) { x[index] }
-filterSpectra(mse, filterByIndex, -idx)
+feat_def <- as.data.frame(featureDefinitions(grdata3))
+feat_def$feature_id <- rownames(feat_def)
+feat_def<- feat_def[which(feat_def$feature_id %in% spspos$feature_id),]
+#feat_def <- feat_def[which(feat_def$possible_contaminants !=TRUE),]
 
-cwp<- CentWaveParam(ppm = 10,
-                    peakwidth = c(3, 10),
-                     prefilter = c(5, 1000000),
-                     noise = 50000)
-data <- findChromPeaks(mse, param = cwp) 
+# ---------------------------------------------------------
+# 1. Define Adducts and Calculate Exact Differences
+# ---------------------------------------------------------
+adducts <- data.frame(
+  adduct = c("[M+H]+", "[M+Na]+", "[M+K]+", "[M+NH4]+", 
+             "[M-H2O+H]+", "[M-2H2O+H]", "[M-CO+H]+", "[M-COOH+H]+"),
+  mass = c(1.007276, 22.989218, 38.963158, 18.033823, 
+           -17.003289, -34.00658, -26.987639, -44.998203)
+)
+
+# Create difference table. 
+# We strictly define a1/m1 as the HEAVIER adduct to make matching foolproof.
+adduct_diff <- adducts %>%
+  dplyr::rename(a1 = adduct, m1 = mass) %>%
+  cross_join(adducts %>%  dplyr::rename(a2 = adduct, m2 = mass)) %>%
+  filter(m1 > m2) %>% # Keep only positive mass differences
+  mutate(
+    delta = m1 - m2,
+    delta_min = delta - 0.002, # Set your tolerance here
+    delta_max = delta + 0.002
+  ) %>%
+  filter(a1 == "[M+H]+" | a2 == "[M+H]+")
+
+# ---------------------------------------------------------
+# 2. Setup the Loop to Process Feature Groups
+# ---------------------------------------------------------
+results_list <- list()
+grs <- unique(feat_def$feature_group)
+
+for(gr in grs) {
+  # Subset current group
+  sb <- feat_def[which(feat_def$feature_group == gr), ]
+  
+  if(nrow(sb) > 1) {
+    # Calculate distance matrix for mzmed
+    mz_dists <- as.matrix(dist(sb$mzmed))
+    rownames(mz_dists) <- sb$feature_id
+    colnames(mz_dists) <- sb$feature_id
+    
+    # Extract coordinates
+    idx <- which(upper.tri(mz_dists), arr.ind = TRUE)
+    
+    # Map back to IDs and MZ values
+    feat_A <- rownames(mz_dists)[idx[, 1]]
+    feat_B <- colnames(mz_dists)[idx[, 2]]
+    mz_A <- sb$mzmed[match(feat_A, sb$feature_id)]
+    mz_B <- sb$mzmed[match(feat_B, sb$feature_id)]
+    
+    pairs <- data.frame(
+      f1 = ifelse(mz_A > mz_B, feat_A, feat_B),
+      f2 = ifelse(mz_A > mz_B, feat_B, feat_A),
+      mz_1 = ifelse(mz_A > mz_B, mz_A, mz_B), 
+      mz_2 = ifelse(mz_A > mz_B, mz_B, mz_A),
+      obs_delta = abs(mz_A - mz_B)
+    ) %>% distinct()
+    
+    # Match pairs to the adduct_diff table
+    matches <- pairs %>%
+      inner_join(
+        adduct_diff, 
+        by = join_by(between(obs_delta, delta_min, delta_max))
+      ) %>%
+      dplyr::select(-delta_min, -delta_max)
+    
+    # ---------------------------------------------------------
+    # 3. Build Subtable (Handling Matches AND Leftovers)
+    # ---------------------------------------------------------
+    if(nrow(matches) > 0) {
+      # Extract annotated assignments
+      sub_f1 <- matches %>% dplyr::select(feature_id = f1, adduct = a1, adduct_mass = m1)
+      sub_f2 <- matches %>% dplyr::select(feature_id = f2, adduct = a2, adduct_mass = m2)
+      
+      annotated_subtable <- bind_rows(sub_f1, sub_f2) %>%
+        distinct() %>%
+        left_join(sb %>% dplyr::select(feature_id, mzmed, rtmed), by = "feature_id") %>%
+        mutate(neutral_mass = mzmed - adduct_mass) %>%
+        dplyr::select(feature_id, mzmed, rtmed, adduct, neutral_mass)
+      
+      # --- THE FIX: CATCH THE LEFTOVERS ---
+      # Find features in this group that didn't get an adduct match
+      leftovers <- sb %>% filter(!feature_id %in% annotated_subtable$feature_id)
+      
+      if(nrow(leftovers) > 0) {
+        leftover_subtable <- leftovers %>%
+          dplyr::select(feature_id, mzmed, rtmed) %>%
+          mutate(
+            adduct = "unk",
+            neutral_mass = mzmed - 1.007276 # Assuming [M+H]+ for unknowns
+          )
+        # Bind the annotated pairs and the leftovers together
+        subtable <- bind_rows(annotated_subtable, leftover_subtable) %>% arrange(mzmed)
+      } else {
+        subtable <- annotated_subtable %>% arrange(mzmed)
+      }
+      
+    } else {
+      # --- THE FIX: NO MATCHES FOUND AT ALL ---
+      # If the group has >1 feature but no math works, treat ALL as singletons
+      subtable <- sb %>%
+        dplyr::select(feature_id, mzmed, rtmed) %>%
+        mutate(
+          adduct = "[M+H]+",
+          neutral_mass = mzmed - 1.007276
+        ) %>% arrange(mzmed)
+    }
+    
+    # Save the complete group to the list
+    group_rtmed <- median(subtable$rtmed)
+    
+    results_list[[as.character(gr)]] <- tibble(
+      feature_group = gr,
+      group_rtmed = group_rtmed,
+      annotated_features = list(subtable),
+      # This will now safely grab the M_mass of both real matches and leftovers
+      M_mass = list(subtable$neutral_mass[which(subtable$adduct == "[M+H]+")]),
+      n = nrow(sb)
+    )
+    
+  } else {
+    # ---------------------------------------------------------
+    # TRUE SINGLETONS (Only 1 feature in the group)
+    # ---------------------------------------------------------
+    subtable <- tibble(
+      feature_id = sb$feature_id, 
+      mzmed = sb$mzmed,
+      rtmed = sb$rtmed, 
+      adduct = "[M+H]+",
+      neutral_mass = sb$mzmed - 1.007276
+    )
+    
+    results_list[[as.character(gr)]] <- tibble(
+      feature_group = gr,
+      group_rtmed = subtable$rtmed,
+      annotated_features = list(subtable),
+      M_mass = list(subtable$neutral_mass[which(subtable$adduct == "[M+H]+")]),
+      n = 1
+    )
+  }
+}
+
+# ---------------------------------------------------------
+# 4. Create the Final Master Table
+# ---------------------------------------------------------
+final_table <- bind_rows(results_list)
+
+# ---------------------------------------------------------
+# 5. refine [M+H]+ identification (handle insource fragmentation)
+# ---------------------------------------------------------
+loss_deltas <- c(18.0106, 36.0212, 54.0318, 27.9949, 44.9976, 43.98983)
+loss_labels <- c("[M-H2O+H]+", "[M-2H2O+H]+",  "[M-3H2O+H]+", "[M-CO+H]+", "[M-COOH+H]+", "[M-CO2+H]+" )
+iso_deltas <- c(1.00335, 2.00671,3.01005)
+
+cleaned_results <- list()
+
+for(q in 1:nrow(final_table)) {
+  
+  row_data <- final_table[q, ]
+  sub_df <- row_data$annotated_features[[1]]
+  m_candidates <- sub_df%>%
+    filter(adduct=="[M+H]+") %>%
+    pull(mzmed) %>%
+    sort()
+  
+  # If there are 0 or 1 [M+H]+ candidates, keep it as is and skip
+  if(length(m_candidates) < 2) {
+    cleaned_results[[q]] <- row_data
+    next
+  }
+  
+  # 1. ISOTOPES
+for (i in 1:(length(m_candidates)-1)) {
+  for (j in (i+1):length(m_candidates)) {
+    
+    # Because we sorted, delta is always negative..inverte
+    delta <- m_candidates[j] - m_candidates[i]
+    
+    if (any(abs(delta - iso_deltas) <= 0.005)) {
+      true_M_iso <- m_candidates[i] 
+      
+      sub_df <- sub_df %>%
+        mutate(
+          adduct = case_when(
+            # The extra "mzmed > true_M_iso" guarantees we only alter the heavier peak
+            abs(mzmed - (true_M_iso + 1.00335)) <= 0.005 & mzmed > true_M_iso & adduct == "[M+H]+" ~ "[M+1+H]+",
+            abs(mzmed - (true_M_iso + 2.00671)) <= 0.005 & mzmed > true_M_iso & adduct == "[M+H]+" ~ "[M+2+H]+",
+            abs(mzmed - (true_M_iso + 3.01005)) <= 0.005 & mzmed > true_M_iso & adduct == "[M+H]+" ~ "[M+3+H]+",
+            TRUE ~ adduct
+          ),
+          # Snap the neutral mass of the isotope back to the monoisotopic parent
+          neutral_mass = ifelse(adduct %in% c("[M+1+H]+", "[M+2+H]+",  "[M+3+H]+"), true_M_iso, neutral_mass)
+        )
+    }
+  }
+}
+  
+  # 2. DIMERS
+  dimer_labels <- c("[2M+H]+", "[2M+Na]+", "[2M+K]+")
+  dimer_additions <- c(1.007276, 22.989218, 38.963158)
+  
+  for (i in 1:(length(m_candidates)-1)) {
+    for (j in (i+1):length(m_candidates)) {
+      
+      # 1. Calculate the neutral mass of the lighter candidate (assumed monomer)
+      true_M_monomer <- m_candidates[i] 
+      true_neutral <- true_M_monomer - 1.007276 
+      
+      for (d in 1:length(dimer_labels)) {
+        
+        expected_dimer_mz <- (2 * true_neutral) + dimer_additions[d]
+        
+        if (abs(m_candidates[j] - expected_dimer_mz) <= 0.005) {
+          
+          target_dimer_label <- dimer_labels[d]
+          sub_df <- sub_df %>%
+            mutate(
+              # Relabel the heavier peak to the correct dimer string
+              adduct = ifelse(abs(mzmed - expected_dimer_mz) <= 0.005 & adduct == "[M+H]+", 
+                              target_dimer_label, adduct),
+              neutral_mass = ifelse(adduct == target_dimer_label, true_neutral, neutral_mass)
+            )
+        }
+      } # End of dimer types loop
+    }
+  }
+  
+  # 3. INSOURCE FRAGMENTATION (Cascades)
+  for (i in 1:(length(m_candidates)-1)) {
+    for (j in (i+1):length(m_candidates)) {
+      
+      # Calculate the mass difference between the two candidates
+      delta <- m_candidates[j] - m_candidates[i]
+      
+      # Loop through our 4 specific losses to see if there's a match
+      for (k in 1:length(loss_deltas)) {
+        
+        if (abs(delta - loss_deltas[k]) <= 0.005) {
+          fake_M_frag <- m_candidates[i]    # The lighter mass (fragment)
+          true_M_cascade <- m_candidates[j] # The heavier mass (parent)
+          target_label <- loss_labels[k]    # Pull the matching text label
+          
+          sub_df <- sub_df %>%
+            mutate(
+              # 1. Update the text label so we know EXACTLY what fell off
+              adduct = ifelse(abs(mzmed - fake_M_frag) <= 0.005 & adduct == "[M+H]+", 
+                              target_label, adduct),
+                              
+              # 2. Snap the neutral mass up to the true parent 
+              neutral_mass = ifelse(adduct == target_label, true_M_cascade, neutral_mass)
+            )
+        }
+      } # End of the loss checking loop
+      
+    }
+  }
+  # 4. FINALIZE THE ROW
+
+  # Update the subtable
+  row_data$annotated_features[[1]] <- sub_df
+  
+  # Dynamically recalculate M_mass based on the features that SURVIVED as [M-H]-
+  # This perfectly preserves any unrelated singletons that were co-eluting!
+  row_data$M_mass[[1]] <- unique(sub_df$neutral_mass[sub_df$adduct == "[M+H]+"])
+  
+  cleaned_results[[q]] <- row_data
+}
+
+# Bind it all back together into a final, pristine table
+cl_table_pos<- bind_rows(cleaned_results)
+
+ftpos<- feat_def
+data_pos <- fdata
 ```
- 
- features creation
- 
+
+#GROUPING NEGATIVE ESI
+
+creating feature group according to rtime, correlation between sample and peak shape correlation 
+
 ```{r}
-#' Peak refinement
-mnp <- MergeNeighboringPeaksParam(expandRt = 2, expandMz = 0.001,
-                                  minProp = 3/4)
-data <- refineChromPeaks(data, param = mnp)
-#' Alignment
-sampleData(data)$highRes <- TRUE
-pdp1 <- PeakDensityParam(sampleGroups = sampleData(data)$highRes, bw = 2,
-                         minFraction = 0.8, binSize = 0.01)
-data <- groupChromPeaks(data, param = pdp1)
-pgp <- PeakGroupsParam(minFraction = 0.8, extraPeaks = 100, span = 0.8)
-data <- adjustRtime(data, param = pgp)
-#' Correspondence analysis
-pdp2 <- PeakDensityParam(sampleGroups =sampleData(data)$highRes, bw = 2,
-                         minFraction = 0.3, binSize = 0.01) 
-data <- groupChromPeaks(data, param = pdp2)
-#' Gap-filling
-data <- fillChromPeaks(data, param = ChromPeakAreaParam())
-ftvalues <-data.frame(featureValues(data, value = "into", method="sum"))
-ftdetec <- data.frame(featureDefinitions(data))
-ftvalues <- ftvalues[rownames(ftvalues) %in% rownames(ftdetec),]
-ftdetec$meanval <- colMeans(t(ftvalues), na.rm = TRUE)
+load("rdata/alt_neg_xcms.RData")
 
-```
- 
-searching for msms related to each features
- 
-```{r}
-ms2_spectra <- featureSpectra(data, expandRt = 0, return.type = "Spectra",
-                              method ="largest_bpi",
-                              ppm = 5, 
-                              featureColumns = c("mzmed", "rtmed", "rtmin", "rtmax"))
-ms2_allspectra_pos <- featureSpectra(data, expandRt = 0, return.type = "Spectra",
-                              ppm = 5, 
-                              featureColumns = c("mzmed", "rtmed", "rtmin", "rtmax"))
+sb<- filterRt(fdata, rt=c(rt_lim1, rt_lim2))
 
-ms2_spectra$id <- paste0(basename(ms2_spectra$dataOrigin), ms2_spectra$scanIndex)
+#grouping for rtime
+grdata1 <- groupFeatures(sb, param = SimilarRtimeParam(5, groupFun =groupConsecutive))
+plotFeatureGroups(grdata1, pch = 21, lwd = 2, col = "#00000040", bg = "#00000020")
 
-#features with at leat one fragmentation spectra
-features <- unique(spectraData(ms2_spectra)$feature_id)
-
+#for correlation across samples
+grdata2 <- groupFeatures(
+    grdata1, AbundanceSimilarityParam(threshold  = 0.6, transform = log2,
+                                      subset=grep("A", sampleData(grdata1)$sample)),
+    filled = TRUE)
+plotFeatureGroups(grdata2, pch = 21, lwd = 2, col = "#00000040", bg = "#00000020")
+#for peak shape
+grdata3 <- groupFeatures(grdata2, EicSimilarityParam(threshold = 0.7, n = 3))
+plotFeatureGroups(grdata3, pch = 21, lwd = 2, col = "#00000040", bg = "#00000020")
 ```
 
-selecting one ms2 for each feature, selecting the one with highest base peak intensity
+adduct recognition for each chromatographic group
 
 ```{r}
+#extracting an filtering feature table
 
-sp <- split(spectraData(ms2_spectra), spectraData(ms2_spectra)$feature_id)
+feat_def <- as.data.frame(featureDefinitions(grdata3))
+feat_def$feature_id <- rownames(feat_def)
+feat_def<- feat_def[which(feat_def$feature_id %in% spsneg$feature_id),]
+#feat_def <- feat_def[which(feat_def$possible_contaminants !=TRUE),]
 
-cp <- vapply(sp, function(x){
-    x$chrom_peak_id[which.max(x$basePeakIntensity)]
-}, character(1))
-ms2_spectra <- ms2_spectra[which(spectraData(ms2_spectra)$chrom_peak_id %in% cp)]
+# ---------------------------------------------------------
+# 1. Define Adducts and Calculate Exact Differences
+# ---------------------------------------------------------
+adducts <- data.frame(
+  adduct = c("[M-H]-", "[M+Cl]-", "[M+Br]-", "[M+HCOO]-", "[M-H2O-H]-", "[M-CO2-H]-", "[M+CH3COO]-", "[M-2H+Na]-"),
+  mass = c(-1.007276,   
+           34.968853,  
+           78.918836,
+           44.998203, 
+           -19.017841,   
+           -44.997105, 
+           59.013853,
+           20.975217)   
+)
 
-#Noise cleaning
-ms2_spectra <- cleaning_ref(ms2_spectra)
 
-spspos<- ms2_spectra
-ftdetec$name <- rownames(ftdetec)
-ftpos <- ftdetec[which(ftdetec$name %in% spspos$feature_id),]
-length(spspos)
-nrow(ftpos)
+# Create difference table. 
+# We strictly define a1/m1 as the HEAVIER adduct to make matching foolproof.
+adduct_diff <- adducts %>%
+  dplyr::rename(a1 = adduct, m1 = mass) %>%
+  cross_join(adducts %>%  dplyr::rename(a2 = adduct, m2 = mass)) %>%
+  filter(m1 > m2) %>% # Keep only positive mass differences
+  mutate(
+    delta = m1 - m2,
+    delta_min = delta - 0.002, # Set your tolerance here
+    delta_max = delta + 0.002
+  ) %>%
+  filter(a1 == "[M-H]-" | a2 == "[M-H]-")
+
+# ---------------------------------------------------------
+# 2. Setup the Loop to Process Feature Groups
+# ---------------------------------------------------------
+results_list <- list()
+grs <- unique(feat_def$feature_group)
+
+for(gr in grs) {
+  # Subset current group
+  sb <- feat_def[which(feat_def$feature_group == gr), ]
+  
+  if(nrow(sb) > 1) {
+    # Calculate distance matrix for mzmed
+    mz_dists <- as.matrix(dist(sb$mzmed))
+    rownames(mz_dists) <- sb$feature_id
+    colnames(mz_dists) <- sb$feature_id
+    
+    # Extract coordinates
+    idx <- which(upper.tri(mz_dists), arr.ind = TRUE)
+    
+    # Map back to IDs and MZ values
+    feat_A <- rownames(mz_dists)[idx[, 1]]
+    feat_B <- colnames(mz_dists)[idx[, 2]]
+    mz_A <- sb$mzmed[match(feat_A, sb$feature_id)]
+    mz_B <- sb$mzmed[match(feat_B, sb$feature_id)]
+    
+    pairs <- data.frame(
+      f1 = ifelse(mz_A > mz_B, feat_A, feat_B),
+      f2 = ifelse(mz_A > mz_B, feat_B, feat_A),
+      mz_1 = ifelse(mz_A > mz_B, mz_A, mz_B), 
+      mz_2 = ifelse(mz_A > mz_B, mz_B, mz_A),
+      obs_delta = abs(mz_A - mz_B)
+    ) %>% distinct()
+    
+    # Match pairs to the adduct_diff table
+    matches <- pairs %>%
+      inner_join(
+        adduct_diff, 
+        by = join_by(between(obs_delta, delta_min, delta_max))
+      ) %>%
+      dplyr::select(-delta_min, -delta_max)
+    
+    # ---------------------------------------------------------
+    # 3. Build Subtable (Handling Matches AND Leftovers)
+    # ---------------------------------------------------------
+    if(nrow(matches) > 0) {
+      # Extract annotated assignments
+      sub_f1 <- matches %>% dplyr::select(feature_id = f1, adduct = a1, adduct_mass = m1)
+      sub_f2 <- matches %>% dplyr::select(feature_id = f2, adduct = a2, adduct_mass = m2)
+      
+      annotated_subtable <- bind_rows(sub_f1, sub_f2) %>%
+        distinct() %>%
+        left_join(sb %>% dplyr::select(feature_id, mzmed, rtmed), by = "feature_id") %>%
+        mutate(neutral_mass = mzmed - adduct_mass) %>%
+        dplyr::select(feature_id, mzmed, rtmed, adduct, neutral_mass)
+      
+      # --- THE FIX: CATCH THE LEFTOVERS ---
+      # Find features in this group that didn't get an adduct match
+      leftovers <- sb %>% filter(!feature_id %in% annotated_subtable$feature_id)
+      
+      if(nrow(leftovers) > 0) {
+        leftover_subtable <- leftovers %>%
+          dplyr::select(feature_id, mzmed, rtmed) %>%
+          mutate(
+            adduct = "unk",
+            neutral_mass = mzmed + 1.007276 # Assuming [M-H]- for unknowns
+          )
+        # Bind the annotated pairs and the leftovers together
+        subtable <- bind_rows(annotated_subtable, leftover_subtable) %>% arrange(mzmed)
+      } else {
+        subtable <- annotated_subtable %>% arrange(mzmed)
+      }
+      
+    } else {
+      # --- THE FIX: NO MATCHES FOUND AT ALL ---
+      # If the group has >1 feature but no math works, treat ALL as singletons
+      subtable <- sb %>%
+        dplyr::select(feature_id, mzmed, rtmed) %>%
+        mutate(
+          adduct = "[M-H]-",
+          neutral_mass = mzmed + 1.007276
+        ) %>% arrange(mzmed)
+    }
+    
+    # Save the complete group to the list
+    group_rtmed <- median(subtable$rtmed)
+    
+    results_list[[as.character(gr)]] <- tibble(
+      feature_group = gr,
+      group_rtmed = group_rtmed,
+      annotated_features = list(subtable),
+      # This will now safely grab the M_mass of both real matches and leftovers
+      M_mass = list(subtable$neutral_mass[which(subtable$adduct == "[M-H]-")]),
+      n = nrow(sb)
+    )
+    
+  } else {
+    # ---------------------------------------------------------
+    # TRUE SINGLETONS (Only 1 feature in the group)
+    # ---------------------------------------------------------
+    subtable <- tibble(
+      feature_id = sb$feature_id, # Fixed typo here
+      mzmed = sb$mzmed,
+      rtmed = sb$rtmed, 
+      adduct = "[M-H]-",
+      neutral_mass = sb$mzmed + 1.007276
+    )
+    
+    results_list[[as.character(gr)]] <- tibble(
+      feature_group = gr,
+      group_rtmed = subtable$rtmed,
+      annotated_features = list(subtable),
+      M_mass = list(subtable$neutral_mass[which(subtable$adduct == "[M-H]-")]),
+      n = 1
+    )
+  }
+}
+
+# ---------------------------------------------------------
+# 4. Create the Final Master Table
+# ---------------------------------------------------------
+final_table <- bind_rows(results_list)
+
+# ---------------------------------------------------------
+# 5. refine [M+H]+ identification (handle insource fragmentation)
+# ---------------------------------------------------------
+loss_deltas <- c(18.0106, 36.0212, 54.0318, 27.9949, 44.9976, 43.98983)
+loss_labels <- c("[M-H2O-H]-", "[M-2H2O-H]-",  "[M-3H2O-H]-", "[M-CO-H]-", "[M-COOH-H]-", "[M-CO2-H]-" )
+iso_deltas <- c(1.00335, 2.00671,3.01005)
+
+cleaned_results <- list()
+
+for(q in 1:nrow(final_table)) {
+  
+  row_data <- final_table[q, ]
+  sub_df <- row_data$annotated_features[[1]]
+  m_candidates <- sub_df%>%
+    filter(adduct=="[M-H]-") %>%
+    pull(mzmed) %>%
+    sort()
+  
+  # If there are 0 or 1 [M+H]+ candidates, keep it as is and skip
+  if(length(m_candidates) < 2) {
+    cleaned_results[[q]] <- row_data
+    next
+  }
+  
+  # 1. ISOTOPES
+  for (i in 1:(length(m_candidates)-1)) {
+    for (j in (i+1):length(m_candidates)) {
+      
+      # Because we sorted, delta is always negative..inverte
+      delta <- m_candidates[j] - m_candidates[i]
+      
+      if (any(abs(delta - iso_deltas) <= 0.005)) {
+        true_M_iso <- m_candidates[i] 
+        
+        sub_df <- sub_df %>%
+          mutate(
+            adduct = case_when(
+              # The extra "mzmed > true_M_iso" guarantees we only alter the heavier peak
+              abs(mzmed - (true_M_iso + 1.00335)) <= 0.005 & mzmed > true_M_iso & adduct == "[M-H]-" ~ "[M+1-H]-",
+              abs(mzmed - (true_M_iso + 2.00671)) <= 0.005 & mzmed > true_M_iso & adduct == "[M-H]-" ~ "[M+2-H]-",
+              abs(mzmed - (true_M_iso + 3.01005)) <= 0.005 & mzmed > true_M_iso & adduct == "[M-H]-" ~ "[M+3-H]-",
+              TRUE ~ adduct
+            ),
+            # Snap the neutral mass of the isotope back to the monoisotopic parent
+            neutral_mass = ifelse(adduct %in% c("[M+1-H]-", "[M+2-H]-",  "[M+3-H]-"), true_M_iso, neutral_mass)
+          )
+      }
+    }
+  }
+  
+  # 2. DIMERS
+  dimer_labels <- c("[2M-H]-", "[2M+Cl]-", "[2M+HCOO]-","[2M-2H+Na]-")
+  dimer_additions <-c(-1.007276, 34.968853, 44.998203, 20.974666)
+  
+  for (i in 1:(length(m_candidates)-1)) {
+    for (j in (i+1):length(m_candidates)) {
+      
+      # 1. Calculate the neutral mass of the lighter candidate (assumed monomer)
+      true_M_monomer <- m_candidates[i] 
+      true_neutral <- true_M_monomer + 1.007276 
+      
+      for (d in 1:length(dimer_labels)) {
+        
+        expected_dimer_mz <- (2 * true_neutral) + dimer_additions[d]
+        
+        if (abs(m_candidates[j] - expected_dimer_mz) <= 0.005) {
+          
+          target_dimer_label <- dimer_labels[d]
+          sub_df <- sub_df %>%
+            mutate(
+              # Relabel the heavier peak to the correct dimer string
+              adduct = ifelse(abs(mzmed - expected_dimer_mz) <= 0.005 & adduct == "[M-H]-", 
+                              target_dimer_label, adduct),
+              neutral_mass = ifelse(adduct == target_dimer_label, true_neutral, neutral_mass)
+            )
+        }
+      } # End of dimer types loop
+    }
+  }
+  
+  # 3. INSOURCE FRAGMENTATION (Cascades)
+  for (i in 1:(length(m_candidates)-1)) {
+    for (j in (i+1):length(m_candidates)) {
+      
+      # Calculate the mass difference between the two candidates
+      delta <- m_candidates[j] - m_candidates[i]
+      
+      # Loop through our 4 specific losses to see if there's a match
+      for (k in 1:length(loss_deltas)) {
+        
+        if (abs(delta - loss_deltas[k]) <= 0.005) {
+          fake_M_frag <- m_candidates[i]    # The lighter mass (fragment)
+          true_M_cascade <- m_candidates[j] # The heavier mass (parent)
+          target_label <- loss_labels[k]    # Pull the matching text label
+          
+          sub_df <- sub_df %>%
+            mutate(
+              # 1. Update the text label so we know EXACTLY what fell off
+              adduct = ifelse(abs(mzmed - fake_M_frag) <= 0.005 & adduct == "[M-H]-", 
+                              target_label, adduct),
+              
+              # 2. Snap the neutral mass up to the true parent 
+              neutral_mass = ifelse(adduct == target_label, true_M_cascade, neutral_mass)
+            )
+        }
+      } # End of the loss checking loop
+      
+    }
+  }
+  # 4. FINALIZE THE ROW
+  
+  # Update the subtable
+  row_data$annotated_features[[1]] <- sub_df
+  
+  # Dynamically recalculate M_mass based on the features that SURVIVED as [M-H]-
+  # This perfectly preserves any unrelated singletons that were co-eluting!
+  row_data$M_mass[[1]] <- unique(sub_df$neutral_mass[sub_df$adduct == "[M+H]+"])
+  
+  cleaned_results[[q]] <- row_data
+}
+
+# Bind it all back together into a final, pristine table
+cl_table_neg<- bind_rows(cleaned_results)
+
+ftneg<- feat_def
+data_neg <- fdata
+
+save(cl_table_pos, cl_table_neg, file="rdata/alt_custom_pairing.RData")
 ```
-
-#NEGATIVE XCMS
-
-loading files 
-using only DDA data, also for peak peaking
+plotting the adducts detected
 
 ```{r}
-pth <- file.path( "alternaria_data/neg/data/mzML")
-fls <- list.files(pth, pattern = "mzML", full.names = TRUE)
-fls <- fls[!grepl("blank|MED|MEDW", fls, ignore.case = TRUE)]
-fls <- fls[grep("DDA", fls)]
-```
+sel_pos <-cl_table_pos %>%
+  dplyr::select(-M_mass,-n) %>% 
+  unnest(cols = c(annotated_features)) %>%
+    as.data.frame() %>%
+  filter(adduct != "unk")%>%
+    filter(adduct != "[M+H]+")
+adduct_counts <- sel_pos %>%
+  filter(adduct != "unk") %>%
+  group_by(adduct) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  mutate(adduct = case_when(
+    adduct %in% c("[M+1+H]+", "[M+2+H]+", "[M+3+H]+") ~ "Isotopes",
+    TRUE ~ adduct
+  )) %>%
+  group_by(adduct) %>%
+  summarise(n = sum(n), .groups = "drop") %>%
+  arrange(desc(n))
 
-peak piking 
+ p<- ggplot(adduct_counts, aes(x = reorder(adduct, n), y = n, fill = adduct)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  labs(y = "Count", x = "Adduct", title="Positive ESI") +
+  scale_fill_brewer(palette = "Set3") +
+  theme_minimal(base_size = 14)
+
+sel_neg <-cl_table_neg %>%
+  dplyr::select(-M_mass,-n) %>% 
+  unnest(cols = c(annotated_features)) %>%
+  as.data.frame()%>%
+  filter(adduct != "unk") %>%
+    filter(adduct != "[M-H]-")
+
+adduct_counts <- sel_neg %>%
+  filter(adduct != "unk") %>%
+  group_by(adduct) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  mutate(adduct = case_when(
+    adduct %in% c("[M+1-H]-", "[M+2-H]-", "[M+3-H]-") ~ "Isotopes",
+    TRUE ~ adduct
+  )) %>%
+  group_by(adduct) %>%
+  summarise(n = sum(n), .groups = "drop") %>%
+  arrange(desc(n))
+
+ n<- ggplot(adduct_counts, aes(x = reorder(adduct, n), y = n, fill = adduct)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  labs(y = "Count", x = "Adduct", title="Negative ESI") +
+  scale_fill_brewer(palette = "Set3") +
+  theme_minimal(base_size = 14)
  
-```{r}
-mse <- readMsExperiment(spectraFiles = fls)
-
-#filter wrong spectra
-idx <- which(round(spectra(mse)$precursorMz) != round(spectra(mse)$isolationWindowTargetMz) & spectra(mse)$msLevel==2)
-filterByIndex <- function(x, index) { x[index] }
-filterSpectra(mse, filterByIndex, -idx)
-
-cwp<- CentWaveParam(ppm = 10,
-                    peakwidth = c(3, 10),
-                     prefilter = c(5, 500000),
-                     noise = 50000)
-data <- findChromPeaks(mse, param = cwp) 
-```
- 
- features creation
- 
-```{r}
-#' Peak refinement
-mnp <- MergeNeighboringPeaksParam(expandRt = 2, expandMz = 0.001,
-                                  minProp = 3/4)
-data <- refineChromPeaks(data, param = mnp)
-#' Alignment
-sampleData(data)$highRes <- TRUE
-pdp1 <- PeakDensityParam(sampleGroups = sampleData(data)$highRes, bw = 2,
-                         minFraction = 0.8, binSize = 0.01)
-data <- groupChromPeaks(data, param = pdp1)
-pgp <- PeakGroupsParam(minFraction = 0.8, extraPeaks = 100, span = 0.8)
-data <- adjustRtime(data, param = pgp)
-#' Correspondence analysis
-pdp2 <- PeakDensityParam(sampleGroups =sampleData(data)$highRes, bw = 2,
-                         minFraction = 0.3, binSize = 0.01) 
-data <- groupChromPeaks(data, param = pdp2)
-#' Gap-filling
-data <- fillChromPeaks(data, param = ChromPeakAreaParam())
-ftvalues <-data.frame(featureValues(data, value = "into", method="sum"))
-ftdetec <- data.frame(featureDefinitions(data))
-ftvalues <- ftvalues[rownames(ftvalues) %in% rownames(ftdetec),]
-ftdetec$meanval <- colMeans(t(ftvalues), na.rm = TRUE)
-```
-
-
-searching for msms realted to each features
- 
-```{r}
-ms2_spectra <- featureSpectra(data, expandRt = 0, return.type = "Spectra",
-                              method ="largest_bpi",
-                              ppm = 5, 
-                              featureColumns = c("mzmed", "rtmed", "rtmin", "rtmax"))
-
-ms2_allspectra_neg <- featureSpectra(data, expandRt = 0, return.type = "Spectra",
-                              ppm = 5, 
-                              featureColumns = c("mzmed", "rtmed", "rtmin", "rtmax"))
-
-
-ms2_spectra$id <- paste0(basename(ms2_spectra$dataOrigin), ms2_spectra$scanIndex)
-
-#features with at leat one fragmentation spectra
-features <- unique(spectraData(ms2_spectra)$feature_id)
-
-```
- 
- selecting one msms for each features
- 
-```{r}
-sp <- split(spectraData(ms2_spectra), spectraData(ms2_spectra)$feature_id)
-
-cp <- vapply(sp, function(x){
-    x$chrom_peak_id[which.max(x$basePeakIntensity)]
-}, character(1))
-ms2_spectra <- ms2_spectra[which(spectraData(ms2_spectra)$chrom_peak_id %in% cp)]
-
-#Noise cleaning
-ms2_spectra <- cleaning_ref(ms2_spectra)
-
-spsneg<- ms2_spectra
-ftdetec$name <- rownames(ftdetec)
-ftneg <- ftdetec[which(ftdetec$name %in% spsneg$feature_id),]
-length(spsneg)
-nrow(ftneg)
-
+plot_grid(p, n, ncol = 2)
 ```
 
 #NEUTRAL
 
-```{r}
-ftpos <- ftpos %>%
-  filter(rtmed>30&rtmed<600)
-ftpos<- ftpos%>%
-  filter(log10(meanval)>6)
-
-ftneg <- ftneg %>%
-  filter(rtmed>30&rtmed<600)
-ftneg <- ftneg %>%
-  filter(log10(meanval)>6)
-
-#create a table with correct mass
-ftpos$neutralmass <- ftpos$mzmed - 1.00728
-ftneg$neutralmass <- ftneg$mzmed + 1.00728
-```
-
-selecting only common ft between positive and negative ionization, match for rt and mz 
+making matching between all positive and negative feature, considering only M+H and M-H pairs
 
 ```{r}
+#extracting feature with protonated or deprotonated forms (excluding isotopes and adducts)
+sel_pos <-cl_table_pos %>%
+  dplyr::select(-M_mass,-n) %>% 
+  unnest(cols = c(annotated_features)) %>%
+    as.data.frame() %>%
+  filter(adduct %in% c("[M+H]+"))
 
-ftpos <- as.data.frame(ftpos)
-ftneg <- as.data.frame(ftneg)
+sel_neg <-cl_table_neg %>%
+  dplyr::select(-M_mass,-n) %>% 
+  unnest(cols = c(annotated_features)) %>%
+  as.data.frame()%>%
+  filter(adduct %in% c("[M-H]-"))
+
 ft_match <- matchValues(
-  ftneg, ftpos, param = MzRtParam(ppm = 5, toleranceRt = 5),
-  mzColname = c("neutralmass", "neutralmass"),
-  rtColname  = c("rtmed", "rtmed")  
+  sel_pos, sel_neg, param = MzRtParam(ppm = 10, toleranceRt = 5),
+  mzColname = c("neutral_mass", "neutral_mass"),
+  rtColname  = c("rtmed", "rtmed")  #prima query e dopo tabella target
   )
-tb_match <- matchedData(ft_match)
+
+tb_match <- matchedData(ft_match) %>%
+  as.data.frame()
 tb_match <- tb_match[!is.na(tb_match$target_mzmed),]
-tb_match <- tb_match[!grepl("\\.", rownames(tb_match)), ]  #delete double matches
-tb_match <- as.data.frame(tb_match)
-tb_match <- tb_match %>%
-  distinct(target_name, .keep_all = TRUE)
-tb_match$n_mass <- (tb_match$neutralmass+tb_match$target_neutralmass)/2
-comonft <- tb_match %>%
-  dplyr::select(all_of(c("rtmed", "n_mass", "meanval")))
-comonft$name_p <- tb_match$target_name
-comonft$name_n <- tb_match$name
+
+#handling double matching
+#ensuring the difference of original m/z is 2.01455
+
+tb_match<- tb_match %>%
+  group_by(feature_id) %>%
+  filter(
+    # Keep the row IF it is the only match (not duplicated)
+    n() == 1 | 
+    # OR keep the row IF it passes your 2.01455 Da distance check
+    abs(abs(target_mzmed - mzmed) - 2.01455) <= 0.005
+  ) %>%
+  ungroup() %>%
+  as.data.frame() %>%
+  dplyr::select(feature_group, feature_id, group_rtmed, mzmed, adduct, target_feature_id, target_group_rtmed, target_mzmed, target_adduct )
+
 ```
 
-selecting MS2 of fature used for NMN and single-polarity MNs
+refining the matches according to inter-polarity correlation of intensities
+
+```{r}
+#filtering for matches which has a correlation between negative and positive
+vals_neg <- featureValues(data_neg) %>%
+    as.data.frame()
+colnames(vals_neg) <- paste0(sampleData(data_neg)$sample,"_", sampleData(data_neg)$rep)
+vals_neg<- vals_neg[,grepl("A", colnames(vals_neg))]
+vals_pos <- featureValues(data_pos) %>%
+    as.data.frame()
+colnames(vals_pos) <- paste0(sampleData(data_pos)$sample,"_", sampleData(data_pos)$rep)
+vals_pos<- vals_pos[,grepl("A", colnames(vals_pos))]
+
+#matching sample order in different polarity
+common_samples <- intersect(colnames(vals_neg), colnames(vals_pos))
+vals_neg <- vals_neg[, common_samples]
+vals_pos <- vals_pos[, common_samples]
+
+tb_match$correlation <- NA
+
+for(i in 1:nrow(tb_match)){
+  neg_id <- tb_match$target_feature_id[i]
+  pos_id <- tb_match$feature_id[i]
+  
+  vln <- vals_neg[neg_id, ] %>%
+    log2()
+  vlp <- vals_pos[pos_id,] %>%
+    log2()
+  
+  valid_indices <- !is.na(vlp) & !is.na(vln)
+  vln <- vln[valid_indices]
+  vlp <- vlp[valid_indices]
+  
+  cor_score<- cor(vln, vlp, method = "pearson")
+  tb_match$correlation[i] <- cor_score
+}
+
+hist(tb_match$correlation)
+
+tb_match <- tb_match %>%
+  filter(abs(correlation) > 0.7)
+
+paste("match with cromatographic correlation:", nrow(tb_match))
+
+#in case of multiple matching select the one with highest correlation across samples
+#for positive ionization
+dup<- unique(tb_match$feature_id[which(duplicated(tb_match$feature_id))])
+
+if(length(dup)>0){
+ 
+tb_match<- tb_match %>%
+  group_by(feature_id) %>%
+  filter(
+    # Keep the row IF it is the only match (not duplicated)
+    n() == 1 | 
+    # OR keep the row IF it passes your 2.01455 Da distance check
+   row_number() == which.max(abs(correlation))
+  ) %>%
+  ungroup()
+
+}
+#for negative ionization
+dup<- unique(tb_match$target_feature_id[which(duplicated(tb_match$target_feature_id))])
+
+if(length(dup)>0){
+ 
+tb_match<- tb_match %>%
+  group_by(target_feature_id) %>%
+  filter(
+    # Keep the row IF it is the only match (not duplicated)
+    n() == 1 | 
+    # OR keep the row IF it passes your 2.01455 Da distance check
+   row_number() ==  which.max(abs(correlation))
+  ) %>%
+  ungroup()
+
+}
+
+paste("match without double results:", nrow(tb_match))
+
+tb_match$n_mass <- (tb_match$mzmed+tb_match$target_mzmed)/2
+comonft <- tb_match %>%
+  dplyr::select(group_rtmed, n_mass) %>%
+  rename("group_rtmed"="rtmed")%>%
+  as.data.frame()
+
+comonft$name_p <- tb_match$feature_id
+comonft$name_n <- tb_match$target_feature_id
+nrow(comonft)
+```
+
+selecting and cleaning MSMS spectra
 
 ```{r warning=FALSE}
-MS2pos <- spspos[which(spspos$feature_id %in% comonft$name_p)]
-MS2neg <- spsneg[which(spsneg$feature_id %in% comonft$name_n)]
+register(SerialParam())
+MS2pos <- spspos[which(spspos$feature_id %in% comonft$name_p)] %>%
+  cleaning_ref()
+MS2neg <- spsneg[which(spsneg$feature_id %in% comonft$name_n)] %>%
+  cleaning_ref()
+
+#precurosr removal
 
 MS2neg <- filterPrecursorPeaks(MS2neg, ppm = 50, mz = ">=")
 MS2pos <- filterPrecursorPeaks(MS2pos, ppm = 50, mz = ">=")
 
-length(MS2neg)
 length(MS2pos)
+length(MS2neg)
 ```
 
-creation of neutral pseudo-spectra from single spectra of negative and positive ESI
+keep MS 2 relative to features detected in MS1 and making a single spectra for negative and positive
 
 ```{r warning=FALSE}
-#function to merge the ions with similar m/z values after the mass "aligment"
+#function to handle overlapping ions
 process_data <- function(data) {
   data <- data %>%
     arrange(mz) %>%
-    mutate(group = cumsum(c(TRUE, diff(mz) >= 0.0005))) %>%
+    mutate(group = cumsum(c(TRUE, diff(mz) >= 0.001))) %>%
     group_by(group) %>%
     summarise(
       mz = mean(mz),
-      intensity = mean(intensity)
+      intensity = sum(intensity)
     ) %>%
     ungroup() %>%
     dplyr::select(-group)
   return(data)
 } 
 
-comonft$spectrum <- NA
-neutral_spectra <- Spectra()
-
-#creation of neutral pseudo-spectra
-for(i in 1:nrow(comonft)){
-  register(SerialParam())
-  #positive
-  fl <- MS2pos
-  akap <- fl[i]
-    if(length(akap)>0){
-    mzpos <- mz(akap)[[1]] 
-    mzpos <- mzpos - 1.00728
-    intpos <- intensity(akap)[[1]]
-    intpos <- (intpos/max(intpos))*100
-    df_pos <- data.frame(mz = mzpos, intensity = intpos)
-    #negative
-    fl <- MS2neg
-    neg_name <- comonft$name_n[which(comonft$name_p==akap$feature_id)]
-    akan <- fl[which(fl$feature_id==neg_name)]
+#NEUTRAL creation
+    
+    #preparing metadata
+    meta <- comonft %>%
+      dplyr::select(rtmed, name_p, name_n) 
+    meta$feature_id <- meta$name_p
+    
+    meta$precursorMz <- NA
+    meta$mz <- meta$intensity <- vector(mode="list", length=nrow(meta))
+    
+    for(i in 1:nrow(meta)){
+      register(SerialParam())
+      
+      #positive
+      akap <- pos[which(pos$id == meta$idx_pos[i])]
+      if(length(akap)>0){
+        mzpos <- mz(akap)[[1]] 
+        mzpos <- mzpos - 1.00728
+        intpos <- intensity(akap)[[1]]
+        intpos <- (intpos/max(intpos))*100
+        df_pos <- data.frame(mz = mzpos, intensity = intpos)
+        
+        #negative
+        akan <- neg[which(neg$id == meta$idx_neg[i])]
         if(length(akan)>0){
-      mzneg <- mz(akan)[[1]] 
-      mzneg <- mzneg + 1.00728
-      intneg <- intensity(akan)[[1]]
-      intneg <- (intneg/max(intneg))*100
-      df_neg <- data.frame(mz = mzneg, intensity = intneg) 
+          mzneg <- mz(akan)[[1]] 
+          mzneg <- mzneg + 1.00728
+          intneg <- intensity(akan)[[1]]
+          intneg <- (intneg/max(intneg))*100
+          df_neg <- data.frame(mz = mzneg, intensity = intneg) 
           
-      #both
-      df <- bind_rows(df_neg, df_pos) %>%
-        arrange(mz)
-      df<- as.data.frame(process_data(df))
-      totmz<- as.numeric(df$mz)
-      totint <- as.numeric(df$intensity)
-      
-      prec<- mean(c(precursorMz(akan),precursorMz(akap)))
-      
-      spectrum<- data.frame(
-        id= akap$feature_id,
-        mz = I(list(totmz)),
-        intensity = I(list(totint)),
-        precursorMz=prec
-      )
-      sps <- Spectra(spectrum)
-      neutral_spectra <- c(neutral_spectra, sps)
+          #both
+          df <- bind_rows(df_neg, df_pos) %>%
+            arrange(mz)
+          df<- as.data.frame(process_data(df))
+          meta$mz[[i]]<- as.numeric(df$mz)
+          meta$intensity[[i]] <- as.numeric(df$intensity)
+          
+          meta$precursorMz[i] <- mean(c(precursorMz(akan),precursorMz(akap)))
+        }
+      }
+      meta_all <- rbind(meta, meta_all)
     }
-  }
-  print(i)
-}
+  
+MS2neu <- Spectra(meta_all)
 
+save(comonft, tb_match, spsneg, spspos,MS2pos, MS2neg, MS2neu, file="rdata/alt_msms2.RData")
 ```
 
-#modualrity mesurements 
-
-global and local modularity for the toxin-related isomers across different similarity threshold (from 0 to 1)
-The mesurements where repeated multiple times (25) in order to consider variability. For each repetition, a MS/MS spectra for each feature where randomly chose within feature related spectra. 
-first we identify our subset of features that are representing the same compound (isomers)
+calculating similarity with GNPS similarity function
 
 ```{r}
-#manual identification 
-toxp <- "FT1776"
-toxn <- "FT1104"
-isop <- c("FT1775","FT1777")
-ison <- c("FT1103","FT1105")
-#identification of dehydratation of toxin isomers
-sub<- comonft[which(MsCoreUtils::between(comonft$rtmed, c(4*60,4.5*60))),]
-sub<- sub[which(MsCoreUtils::between(sub$n_mass, 264.1360+0.0005*c(-1,1))),]
-allisop <- c(isop, sub$name_p, toxp)
-allison <- c(ison, sub$name_n, toxn)
+matrix <- compareSpectra(MS2neu, MAPFUN = joinPeaksGnps, tolerance = 0.01, FUN = MsCoreUtils::gnps)
+colnames(matrix)<- MS2neu$feature_id
+rownames(matrix)<- MS2neu$feature_id
+matrix_pos <- compareSpectra(MS2pos, MAPFUN = joinPeaksGnps, tolerance = 0.01, FUN = MsCoreUtils::gnps)
+colnames(matrix_pos)<- MS2pos$feature_id
+rownames(matrix_pos)<- MS2pos$feature_id
+matrix_neg <- compareSpectra(MS2neg, MAPFUN = joinPeaksGnps, tolerance = 0.01, FUN = MsCoreUtils::gnps)
+colnames(matrix_neg)<- MS2neg$feature_id
+rownames(matrix_neg)<- MS2neg$feature_id
+
+save(comonft, matrix, matrix_pos, matrix_neg, tb_match, spsneg, spspos,MS2pos, MS2neg, MS2neu, file="rdata/alt_msms.RData")
 ```
 
-define the function for local modularity calculation
+#MNs
+
+names to highlighte
 
 ```{r}
-LQ <- function(graph, allisop) {
-  
-  # Ensure subgroup nodes exist
-  allisop <- intersect(allisop, V(graph)$name)
-  if (length(allisop) == 0) stop("No subgroup nodes found in the graph.")
-  
-  # Subgraph of the subgroup
-  sub <- induced_subgraph(graph, vids = allisop)
-  
-  # Total weight of edges inside the subgroup
-  Li <- sum(E(sub)$weight)
-  
-  # Identify 1-hop neighbors of subgroup
-  vicini <- unique(unlist(neighborhood(graph, order = 1, nodes = allisop)))
-  
-  # Local subgraph: subgroup + neighbors
-  local_subgraph <- induced_subgraph(graph, vids = vicini)
-  
-  # Total weight of edges in local subgraph
-  L_N <- sum(E(local_subgraph)$weight)
-  
-  # Local modularity
-  LQ_value <- Li / L_N
-  
-  return(LQ_value)
-}
+#LT toxin names (3 isomers)
+
+tname_p <- comonft$name_p[which(MsCoreUtils::between(comonft$n_mass, 282.1466+0.001*c(-1,1))&
+                   MsCoreUtils::between(comonft$rtmed, c(240,280)))]
+
+tname_n <- comonft$name_n[which(comonft$name_p %in% tname_p)]
 ```
 
-calualtion of modularities across similarity thresholds, different validation considering differnt fragemntation spectra for each feature
+neutral molecualr network (interactive)
 
 ```{r}
-ms2_spectra_neg<- ms2_allspectra_neg    #all negative MS/MS
-ms2_spectra_pos <- ms2_allspectra_pos    #all positive MS/MS
-#giving an id for changing spectra within a feature
-ms2_spectra_neg$idf <- paste0(ms2_spectra_neg$scanIndex, basename(ms2_spectra_neg$dataOrigin))
-ms2_spectra_neg<- ms2_spectra_neg[!duplicated(ms2_spectra_neg$idf)]
-ms2_spectra_pos$idf <- paste0(ms2_spectra_pos$scanIndex, basename(ms2_spectra_pos$dataOrigin))
-ms2_spectra_pos<- ms2_spectra_pos[!duplicated(ms2_spectra_pos$idf)]
+threshold <- 0.7
 
-metadata_neg <- as.data.frame(spectraData(ms2_spectra_neg))
-metadata_pos <- as.data.frame(spectraData(ms2_spectra_pos))
+adj_matrix <- matrix
+adj_matrix[adj_matrix < threshold] <- 0
+diag(adj_matrix) <- 0
 
-valtab <- data.frame(rep=1:25)
-valtab$data <- vector(mode="list", length=nrow(valtab))
-valtab$LQ <- vector(mode="list", length=nrow(valtab))
-
-#loop for differnet validation
-
-for(w in 1:nrow(valtab)){
-#selecting neg sps
-  tmpneg<- Spectra()
-unique_features <- metadata_neg %>%
-  group_by(feature_id) %>%
-  slice_sample(n = 1) %>%
-  ungroup() %>%
-  filter(feature_id %in% MS2neg$feature_id)
-tmpneg <- ms2_spectra_neg[match(unique_features$idf, ms2_spectra_neg$idf)]
-tmpneg$id<- tmpneg$feature_id
-#selecting pos sps
-tmppos<- Spectra()
-unique_features <- metadata_pos %>%
-  group_by(feature_id) %>%
-  slice_sample(n = 1) %>%
-  ungroup() %>%
-  filter(feature_id %in% MS2pos$feature_id)
-tmppos <- ms2_spectra_pos[match(unique_features$idf, ms2_spectra_pos$idf)]
-tmppos$id <- tmppos$feature_id
-#making neutral
-tmpneu <- Spectra()
-for(i in 1:nrow(comonft)){
-  register(SerialParam())
-  #positive
-  fl <- tmppos
-  akap <- fl[which(fl$feature_id==comonft$name_p[i])]
-  if(length(akap)>0){
-    mzpos <- mz(akap)[[1]] - 1.00728
-    intpos <- intensity(akap)[[1]]
-    intpos <- (intpos/max(intpos))*100
-    df_pos <- data.frame(mz = mzpos, intensity = intpos)
-    #negative
-    fl <- tmpneg
-    akan <- fl[which(fl$feature_id==comonft$name_n[i])]
-    if(length(akan)>0){
-      mzneg <- mz(akan)[[1]] + 1.00728
-      intneg <- intensity(akan)[[1]]
-      intneg <- (intneg/max(intneg))*100
-      df_neg <- data.frame(mz = mzneg, intensity = intneg) 
-      
-      #both
-      df <- bind_rows(df_neg, df_pos) %>%
-        arrange(mz)
-      df<- as.data.frame(process_data(df))
-      totmz<- as.numeric(df$mz)
-      totint <- as.numeric(df$intensity)
-      
-      prec<- max(c(precursorMz(akan),precursorMz(akap)))
-      precint<- mean(precursorIntensity(akap)+precursorIntensity(akan))
-      
-      spectrum<- data.frame(
-        id= comonft$name_p[i],
-        mz = I(list(totmz)),
-        intensity = I(list(totint)),
-        precursorMz=prec,
-        precursorIntensity=precint,
-        rtime <- comonft$rtmed[i]
-      )
-      spectrum <- Spectra(spectrum)
-      tmpneu <- c(tmpneu, spectrum)
-    }
-  }
-}
-register(MulticoreParam(detectCores() - 1))  
-#create matrices
-mat_neu <- compareSpectra(tmpneu, MAPFUN = joinPeaksGnps, tolerance = 0.01, FUN = MsCoreUtils::gnps, BPPARAM = MulticoreParam())
-mat_neg <- compareSpectra(tmpneg, MAPFUN = joinPeaksGnps, tolerance = 0.01, FUN = MsCoreUtils::gnps, BPPARAM = MulticoreParam())
-mat_pos <- compareSpectra(tmppos, MAPFUN = joinPeaksGnps, tolerance = 0.01, FUN = MsCoreUtils::gnps, BPPARAM = MulticoreParam())
-
-seq <- seq(0,1,0.05)  #simialrity threshold for the mesurements
-
-#df for global modualrity
-mod_thr <- data.frame(n=seq,   
-                      neu=NA,
-                      pos=NA,
-                      neg=NA)
-#df for local modularity 
-LQ_thr <- data.frame(n=seq,
-                     neu=NA,
-                     pos=NA,
-                     neg=NA)
-
-#nodes to consider
-all_nodes <- data.frame(
-  id = neutral_spectra$id
-)
-all_nodes_p <- data.frame(
-  id = MS2pos$feature_id
-)
-all_nodes_n <- data.frame(
-  id = MS2neg$feature_id
+g <- graph_from_adjacency_matrix(
+  adj_matrix,
+  mode = "undirected",
+  weighted = TRUE,
+  diag = FALSE
 )
 
-#making MNs an calculate modularity and LQ for toxin isomers
+nodes <- data.frame(
+  id    = V(g)$name)
 
-for(i in 1:length(seq)){
-  thr <- seq[i]
-  #neu
-  edges<- create_edge_list(mat_neu, thr, tmpneu)
-  gneu <- graph_from_data_frame(d = edges, vertices = all_nodes, directed = FALSE)
-  V(gneu)$iso<- NA
-  V(gneu)$iso[which(V(gneu)$name%in% allisop)]<- "toxin"
-  V(gneu)$community <- ifelse(V(gneu)$name %in% allisop, 1, 2)
-  mod_thr$neu[i]<- modularity(gneu, membership = V(gneu)$community)
-  LQ_thr$neu[i]<- LQ(gneu, allisop)
-  #pos
-  edges<- create_edge_list(mat_pos, thr, tmppos)
-  gpos <- graph_from_data_frame(d = edges, vertices = all_nodes_p, directed = FALSE)
-  V(gpos)$iso<- NA
-  V(gpos)$iso[which(V(gpos)$name%in%allisop)]<- "toxin"
-  V(gpos)$community <- ifelse(V(gpos)$name %in% allisop, 1, 2)
-  mod_thr$pos[i]<-modularity(gpos, membership = V(gpos)$community)
-  LQ_thr$pos[i]<- LQ(gpos, allisop)
-  #neg
-  edges<- create_edge_list(mat_neg, thr, tmpneg)
-  gneg <- graph_from_data_frame(d = edges, vertices = all_nodes_n, directed = FALSE)
-  V(gneg)$iso<- NA
-  V(gneg)$iso[which(V(gneg)$name%in%allison)]<- "toxin"
-  V(gneg)$community <- ifelse(V(gneg)$name %in% allison, 1, 2)
-  mod_thr$neg[i]<- modularity(gneg, membership = V(gneg)$community)
-  LQ_thr$neg[i]<- LQ(gneg, allison)
-}
-valtab$data[[w]] <-mod_thr
-valtab$LQ[[w]] <-LQ_thr
-print(w)
-}
+mtc <- match(nodes$id,
+             comonft$name_p)
 
+nodes$rt <- round(comonft$rtmed[mtc]/60,2)
+nodes$mz<- round(comonft$n_mass[mtc],4)
+nodes$title <- paste(nodes$id,"\n",nodes$mz,"@",nodes$rt)
+
+nodes$color <- ifelse(nodes$id %in% tname_p, "indianred", "lightgray")
+
+edges <- data.frame(
+  from = ends(g, E(g))[,1],
+  to   = ends(g, E(g))[,2]
+)
+
+mn <- visNetwork(nodes, edges) %>%
+  visIgraphLayout(layout = "layout_with_fr") %>%
+  visOptions(highlightNearest = list(enabled = TRUE, degree = 1)) %>%
+  visNodes(shape = "dot", borderWidth = 0) %>%
+  visEdges(selectionWidth = 3) %>%
+  visPhysics(solver = "forceAtlas2Based", 
+             forceAtlas2Based = list(springLength = 100))
+
+mn
 ```
-
-
-
-
-
-
