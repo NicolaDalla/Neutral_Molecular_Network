@@ -947,7 +947,7 @@ process_data <- function(data) {
       register(SerialParam())
       
       #positive
-      akap <- pos[which(pos$id == meta$idx_pos[i])]
+      akap <- MS2pos[which(MS2pos$feature_id == meta$feature_id[i])]
       if(length(akap)>0){
         mzpos <- mz(akap)[[1]] 
         mzpos <- mzpos - 1.00728
@@ -956,7 +956,7 @@ process_data <- function(data) {
         df_pos <- data.frame(mz = mzpos, intensity = intpos)
         
         #negative
-        akan <- neg[which(neg$id == meta$idx_neg[i])]
+        akan <- MS2neg[which(MS2neg$feature_idid == meta$name_n[i])]
         if(length(akan)>0){
           mzneg <- mz(akan)[[1]] 
           mzneg <- mzneg + 1.00728
@@ -976,7 +976,7 @@ process_data <- function(data) {
       }
       meta_all <- rbind(meta, meta_all)
     }
-  
+
 MS2neu <- Spectra(meta_all)
 
 save(comonft, tb_match, spsneg, spspos,MS2pos, MS2neg, MS2neu, file="rdata/alt_msms2.RData")
