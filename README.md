@@ -34,7 +34,9 @@ The workflow is implemented in R Markdown files, making it reproducible.
 - **`subclass_prediction.Rmd`**  
   Subclass prediction from network neighborhoods based on majority vote for MSMS library.  
 
-- **`biological_sample_workflow.Rmd`**  
-  Case study on fungal metabolomics. Include: MS data processing, identification of neagtive/positive feature pairs and the demostration of NMN clustering of toxin-related features.  
-
+- **`biological_sample_NMN.Rmd`**  
+  Case study on fungal untargeted metabolomics. Include: chromatographic feature grouping, identification of adduct, neagtive/positive feature pairs identification and neutral pseudo-spectra creation, with relative NMN.
+  
+- **`bio_sample_Subclass_Mods.Rmd`**  
+  Modulairty and local modualarity claualtion across different similarity threshold, based on chamical subclass identification, to evalaute MNs clustering accuracy.
 ---
