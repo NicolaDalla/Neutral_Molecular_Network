@@ -42,4 +42,7 @@ The workflow is implemented in R Markdown files, making it reproducible.
   
 - **`mirror_plot_neutral_MSMS.Rmd`**  
   Function to plot neutral pseudo-spectra form biological sample.
+  
+- **`subsetting_effect.Rmd`**  
+  Effect of subsetting according to neutral pseudo-spectra pairing workflow on modualrity ad assortativty on sigle polarities networks. Original, unfiltered MNs are compared against MNs containing feature used in the neutral pseudo-spectra creation.
 ---
