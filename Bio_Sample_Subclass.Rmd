@@ -1,0 +1,441 @@
+---
+title: "Bio_sample_Subclass"
+output: html_document
+date: "2026-04-20"
+---
+
+```{r}
+library(Spectra)
+library(RuSirius)
+library(MsCoreUtils)
+library(tidyverse)
+```
+
+Since ww are working on untargeted dataset, the chemciual classification of the detected features is not known.
+The plan is to forecast the chemical subclass for each feature using Sirius softwer.
+RuSirius pakage can be used to communicate with SIRIUS througth R environment.
+Fist, we load the MSMS data from the precedent step 'Biological_sample_workflow', so we have negative, positive and neutral spectra of considered features 
+
+```{r}
+# loading MSMS data
+load("rdata/alt_msms.RData")
+```
+
+Now for each original polarities (positive and negative MSMS) we run a SIRIUS experiment in order to ave the prediction of chemicla classes for each features
+We assume all feature considered are [M+H]+ and [M-H]- adducts.
+
+POSITIVE ESI
+
+```{r}
+# PS: opening SIRIUS with a registered account
+srs <- Sirius()
+
+#selecting spectra
+sp_subset <- MS2pos
+sp_subset <- setBackend(sp_subset, MsBackendMemory())
+sp_subset <- filterEmptySpectra(sp_subset)
+
+srs <- import(sirius = srs,
+              spectra = sp_subset,
+              ms_column_name = "feature_id",
+              deleteExistingFeatures = TRUE)
+
+#run Sirius analysis
+
+run(srs,
+    fallbackAdducts = c("[M + H]+"),
+    formulaIdParams = formulaIdParam(numberOfCandidates = 10,
+                                       instrument = "ORBITRAP",
+                        numberOfCandidatesPerIonization = 3,
+                        massAccuracyMS2ppm = 5,
+                        filterByIsotopePattern = FALSE,
+                        isotopeMs2Settings = c("SCORE"),
+                        performDeNovoBelowMz = 600,
+                        minPeaksToInjectSpecLibMatch = 3),
+    predictParams = predictParam(),
+
+    structureDbSearchParams = structureDbSearchParam(
+          structureSearchDbs = c("BIO")
+      ),
+    recompute = TRUE,
+    wait = TRUE
+    )
+srs_pos <- srs
+res_pos <- summary(sirius = srs_pos, result.type = "structure")
+class_pos <- results(srs_pos, result.type="compoundClass",
+                     return.type = "data.frame")
+
+```
+
+NEGATIVE ESI
+
+```{r}
+# PS: opening SIRIUS with a registered account
+srs <- Sirius()
+
+#selecting spectra
+sp_subset <- MS2neg
+sp_subset <- setBackend(sp_subset, MsBackendMemory())
+sp_subset <- filterEmptySpectra(sp_subset)
+
+srs <- import(sirius = srs,
+              spectra = sp_subset,
+              ms_column_name = "feature_id",
+              deleteExistingFeatures = TRUE)
+
+#run Sirius analysis
+
+run(srs,
+    fallbackAdducts = c("[M - H]-"),
+    formulaIdParams = formulaIdParam(numberOfCandidates = 10,
+                                       instrument = "ORBITRAP",
+                        numberOfCandidatesPerIonization = 3,
+                        massAccuracyMS2ppm = 5,
+                        filterByIsotopePattern = FALSE,
+                        isotopeMs2Settings = c("SCORE"),
+                        performDeNovoBelowMz = 600,
+                        minPeaksToInjectSpecLibMatch = 3),
+    predictParams = predictParam(),
+
+    structureDbSearchParams = structureDbSearchParam(
+          structureSearchDbs = c("BIO")
+      ),
+    recompute = TRUE,
+    wait = TRUE
+    )
+srs_neg <- srs
+res_neg<- summary(sirius = srs_neg, result.type = "structure")
+class_neg <- results(srs_neg, result.type="compoundClass",
+                     return.type = "data.frame")
+
+```
+
+Now, for each feature, we have chemical classification for both ESI.
+For each feature we extract the subclass with the highest probability.
+We consider a reliable prediction only the once with the same subclass prediction in both ESI.
+
+```{r}
+#loop to identify one class and subclass for each feature
+#we store the results in the 'comonft' dataframe, which has been used for neutral pseudo-spectra pairing
+comonft$class_neg <- NA
+comonft$subclass_neg <- NA
+comonft$class_pos <- NA
+comonft$subclass_pos <- NA
+
+for (i in 1:nrow(comonft)){
+  #negative part
+   n <- comonft$name_n[i]
+   sb <- class_neg[class_neg$xcms_fts== n,] %>%
+     filter(type=="ClassyFire") 
+   
+   if(nrow(sb)>0){
+     cl <- sb %>%
+       filter(level =="Class") %>%
+       slice_max(probability, n=1) %>%
+       pull(name)
+    if(length(cl)>0){
+      comonft$class_neg[i] <- cl
+    }
+      scl <- sb %>%
+       filter(level =="Subclass") %>%
+       slice_max(probability, n=1) %>%
+       pull(name)
+ if(length(scl)>0){
+        comonft$subclass_neg[i] <- scl
+ }
+   }
+   
+    #positive part
+   p <- comonft$name_p[i]
+   sb <- class_pos[class_pos$xcms_fts== p,] %>%
+     filter(type=="ClassyFire") 
+   
+   if(nrow(sb)>0){
+     cl <- sb %>%
+       filter(level =="Class") %>%
+       slice_max(probability, n=1) %>%
+       pull(name)
+      if(length(cl)>0){
+        comonft$class_pos[i] <- cl
+        }
+      scl <- sb %>%
+       filter(level =="Subclass") %>%
+       slice_max(probability, n=1) %>%
+       pull(name)
+          if(length(scl)>0){
+        comonft$subclass_pos[i] <- scl
+        }
+   }
+ }
+
+
+#consensus classes 
+comonft$sbclass_neu  <- NA
+comonft$class_neu  <- NA
+
+comonft$sbclass_neu <- ifelse(comonft$subclass_neg == comonft$subclass_pos, comonft$subclass_pos, NA) 
+comonft$class_neu <- ifelse(comonft$class_neg == comonft$class_pos, comonft$class_pos, NA) 
+
+```
+
+Now we evaluate the networks performance with modularity mesurements based on subclass labelling
+Different networks can be build considering different MSMS form the same feature (compound). For this, initial xcms data from both polarities are needed.
+The aim is to initially create a id for each MSMS detected in initial DDA.
+
+```{r}
+#extract all msms realted to features (loaded during xcms processing)
+
+#positive msms
+load("rdata/alt_pos_xcms.RData")
+
+msms <- Spectra(sampleData(mse)$spectraOrigin)
+msms$idf <- paste0(msms$scanIndex, basename(msms$dataOrigin),round(msms$precursorIntensity))
+msms$feature_id <- NA
+
+for(x in 1:length(MS2pos)){
+  mzx <-precursorMz(MS2pos)[x]
+  rtx <- rtime(MS2pos)[x]
+  
+  msms$feature_id[which(MsCoreUtils::between(msms$precursorMz, mzx +0.001*c(-1,1))&
+          MsCoreUtils::between(msms$rtime, rtx+5*c(-1,1)))] <- MS2pos$feature_id[x]
+}
+spspos <- msms
+
+#negative msms
+load("rdata/alt_neg_xcms.RData")
+
+msms <- Spectra(sampleData(mse)$spectraOrigin)
+msms$idf <- paste0(msms$scanIndex, basename(msms$dataOrigin),round(msms$precursorIntensity))
+msms$feature_id <- NA
+
+for(x in 1:length(MS2neg)){
+  mzx <-precursorMz(MS2neg)[x]
+  rtx <- rtime(MS2neg)[x]
+  
+  msms$feature_id[which(MsCoreUtils::between(msms$precursorMz, mzx +0.001*c(-1,1))&
+          MsCoreUtils::between(msms$rtime, rtx+5*c(-1,1)))] <- MS2neg$feature_id[x]
+}
+spsneg<- msms
+
+metadata_pos <- as.data.frame(spectraData(spspos))
+metadata_neg <- as.data.frame(spectraData(spsneg))
+```
+
+Now we calculate the modularity (global) and also local modularity (for given chemical subclasses) across different similarity thresholds (0-1).
+In each repetition, for each feature, a related MSMS is randomly chosen between the avaiable one, for each polarity. Neutral pseudo-spectra are then re-buit and similarity matrix re-calculated. Note this can be a computationally heavy task.
+
+```{r}
+#utility functios
+
+    #to evaluate connectivity of given names and overall modularity
+      eval_net <- function(adj_matrix, node_names_ref, cm2_names_ref) {
+          adj <- adj_matrix
+          adj[adj < threshold] <- 0
+          diag(adj) <- 0
+          g <- graph_from_adjacency_matrix(adj, mode = "undirected", weighted = TRUE, diag = FALSE)
+          
+          V(g)$class <- comonft$class[match(V(g)$name, node_names_ref)]
+          V(g)$subclass <- comonft$subclass[match(V(g)$name, node_names_ref)]
+          
+          tot <- numeric(nrow(df)); corr <- numeric(nrow(df)); wrong <- numeric(nrow(df)); mod <-        numeric(nrow(df))
+          
+          for(i in 1:nrow(df)) {
+            node_name <- cm2_names_ref[i]
+            v <- V(g)[V(g)$name == node_name]
+            
+            if(length(v) > 0) {
+              nh <- ego(g, order = 1, nodes = v)[[1]]
+              nh <- setdiff(nh, v)
+              cls <- V(g)$subclass[nh]
+              or_cl <- cm2$Subclass[which(cm2_names_ref == node_name)]
+              
+              tot[i] <- length(cls)
+              corr[i] <- length(which(cls == or_cl))
+              wrong[i] <- length(which(cls != or_cl & !is.na(cls)))
+            }
+          }
+          
+          mem <- as.numeric(factor(V(g)$subclass))
+          mem[is.na(mem)] <- 99
+          mod <- modularity(g, membership = mem)
+          
+          return(list(tot = tot, corr = corr, wrong = wrong, mod = mod))
+      }
+
+      #function to handle overlapping ions
+      process_data <- function(data) {
+        data <- data %>%
+          arrange(mz) %>%
+          mutate(group = cumsum(c(TRUE, diff(mz) >= 0.001))) %>%
+          group_by(group) %>%
+          summarise(
+            mz = mean(mz),
+            intensity = sum(intensity)
+          ) %>%
+          ungroup() %>%
+          dplyr::select(-group)
+        return(data)
+      } 
+    
+    #to compute LQ calacualtion
+     process_lq <- function(adj_mat, mode_name, node_names_ref) {
+          adj <- adj_mat
+          adj[adj < threshold] <- 0
+          diag(adj) <- 0
+          g <- graph_from_adjacency_matrix(adj, mode = "undirected", weighted = TRUE, diag = FALSE)
+          V(g)$subclass <- comonft$subclass[match(V(g)$name, node_names_ref)]
+          
+          res <- sapply(target_cls, function(x) {
+            nodes_in_cls <- V(g)$name[which(V(g)$subclass == x)]
+            if(length(nodes_in_cls) > 1) {
+              tryCatch(LQ(g, nodes_in_cls), error = function(e) NA)
+            } else { NA }
+          })
+          return(data.frame(thr = threshold, Mode = mode_name, Class = target_cls, LQ = res))
+     }
+     
+# loop for MODs calculation across different thresholds
+
+target_cls <- c("Sesquiterpenoids", "Amino acids, peptides, and analogues", "Terpene lactones", "Diterpenoids")  #for LQ calculation
+
+valtab <- data.frame(rep=1:25)
+valtab$data <- vector(mode="list", length=nrow(valtab))
+valtab$LQ <- vector(mode="list", length=nrow(valtab))
+
+# OUTER LOOP: msms boostrap
+
+for(rep_idx in 1:nrow(valtab)) {
+  cat(sprintf("-> Execution %d of %d\n", rep_idx, nrow(valtab)))
+  
+  #positive selection
+  unique_ids <- metadata_pos %>%
+    group_by(feature_id) %>%
+    slice_sample(n = 1) %>%      #random sampling one msms for each feature
+    ungroup() %>%
+    filter(feature_id %in% MS2neu$feature_id)
+  tmppos<- spspos[match(unique_ids$idf, spspos$idf)] %>%
+    cleaning_ref()
+  
+  #neagtive selection
+  unique_ids <- metadata_neg %>%
+    group_by(feature_id) %>%
+    slice_sample(n = 1) %>%      #random sampling one msms for each feature
+    ungroup() %>%
+    filter(feature_id %in% MS2neg$feature_id)
+  tmpneg<- spsneg[match(unique_ids$idf, spsneg$idf)] %>%
+    cleaning_ref()
+  
+  #neutral formation
+  nn<- comonft$name_p[match(tmpneg$feature_id,comonft$name_n)]
+  pn <- unique(nn, tmppos$feature_id)
+  
+  meta <- comonft %>%
+    dplyr::select(rtmed, name_p, name_n) 
+  meta$feature_id <- meta$name_p
+  
+  meta$precursorMz <- NA
+  meta$mz <- meta$intensity <- vector(mode="list", length=nrow(meta))
+  
+  for(i in 1:nrow(meta)){
+    register(SerialParam())
+    
+    #positive
+    akap <- tmppos[which(tmppos$feature_id == meta$feature_id[i])]
+    if(length(akap)>0){
+      mzpos <- mz(akap)[[1]] 
+      mzpos <- mzpos - 1.00728
+      intpos <- intensity(akap)[[1]]
+      intpos <- (intpos/max(intpos))*100
+      df_pos <- data.frame(mz = mzpos, intensity = intpos)
+      
+      #negative
+      akan <- tmpneg[which(tmpneg$feature_id == meta$name_n[i])]
+      if(length(akan)>0){
+        mzneg <- mz(akan)[[1]] 
+        mzneg <- mzneg + 1.00728
+        intneg <- intensity(akan)[[1]]
+        intneg <- (intneg/max(intneg))*100
+        df_neg <- data.frame(mz = mzneg, intensity = intneg) 
+        
+        #both
+        df <- bind_rows(df_neg, df_pos) %>%
+          arrange(mz)
+        df<- as.data.frame(process_data(df))
+        meta$mz[[i]]<- as.numeric(df$mz)
+        meta$intensity[[i]] <- as.numeric(df$intensity)
+        
+        meta$precursorMz[i] <- mean(c(precursorMz(akan),precursorMz(akap)))
+      }
+    }
+    meta_all <- rbind(meta, meta_all)
+  }
+  
+  tmpneu <- Spectra(meta_all)
+  
+  #create matrices
+  register(SerialParam())
+  mat_neu <- compareSpectra(tmpneu, MAPFUN = joinPeaksGnps, tolerance = 0.01, FUN = MsCoreUtils::gnps)
+  colnames(mat_neu)<- rownames(mat_neu) <- tmpneu$feature_id
+  mat_neg <- compareSpectra(tmpneg, MAPFUN = joinPeaksGnps, tolerance = 0.01, FUN = MsCoreUtils::gnps)
+  colnames(mat_neg)<- rownames(mat_neg) <- tmpneg$feature_id
+  mat_pos <- compareSpectra(tmppos, MAPFUN = joinPeaksGnps, tolerance = 0.01, FUN = MsCoreUtils::gnps)
+  colnames(mat_pos)<- rownames(mat_pos) <- tmppos$feature_id
+  
+  #results of MOD and LQ
+  seq <- seq(0,1,0.05)
+  
+  main <- data.frame(thr = seq, mod_neu = NA, mod_pos = NA, mod_neg = NA)
+  main$data <- vector("list", length(seq))
+  lq_results <- list()
+  
+  #INNER LOOP: Similarity thr
+  
+  for(k in 1:nrow(main)){
+    threshold <- main$thr[k]
+    
+    # D.1 LQ CALCULATION
+    
+    # Run for all three modes
+    res_neu <- process_lq(mat_neu, "Neutral", comonft$name_p)
+    res_pos <- process_lq(mat_pos, "Positive", comonft$name_p)
+    res_neg <- process_lq(mat_neg, "Negative", comonft$name_n)
+    
+    lq_results[[k]] <- bind_rows(res_neu, res_pos, res_neg)
+    
+    # D.2 CONNECTIVITY & MODULARITY
+    df <- data.frame(
+      id = cm2$name_p[which(!is.na(cm2$Subclass))],
+      tot_conn_neu = NA, corr_conn_neu = NA, wrong_conn_neu = NA,
+      tot_conn_pos = NA, corr_conn_pos = NA, wrong_conn_pos = NA,
+      tot_conn_neg = NA, corr_conn_neg = NA, wrong_conn_neg = NA
+    )
+    
+    #repeat for the 3 polarity
+    net_neu <- eval_net(mat_neu, comonft$name_p, cm2$name_p)
+    df$tot_conn_neu <- net_neu$tot; df$corr_conn_neu <- net_neu$corr; df$wrong_conn_neu <- net_neu$wrong
+    main$mod_neu[k] <- net_neu$mod
+    
+    net_pos <- eval_net(mat_pos, comonft$name_p, cm2$name_p)
+    df$tot_conn_pos <- net_pos$tot; df$corr_conn_pos <- net_pos$corr; df$wrong_conn_pos <- net_pos$wrong
+    main$mod_pos[k] <- net_pos$mod
+    
+    net_neg <- eval_net(mat_neg, comonft$name_n, cm2$name_n)
+    df$tot_conn_neg <- net_neg$tot; df$corr_conn_neg <- net_neg$corr; df$wrong_conn_neg <- net_neg$wrong
+    main$mod_neg[k] <- net_neg$mod
+    
+    main$data[[k]] <- df
+  }
+  
+  valtab$data[[rep_idx]] <- main
+  valtab$LQ[[rep_idx]] <- bind_rows(lq_results)
+}
+```
+
+
+
+
+
+
+
+
+
