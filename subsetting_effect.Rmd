@@ -1,0 +1,283 @@
+---
+title: "alt_allMNs"
+output: html_document
+date: "2026-04-08"
+---
+
+```{r}
+library(xcms)
+library(Spectra)
+library(MsCoreUtils)
+library(tidyverse)
+library(igraph)
+library(visNetwork)
+library(MASS)
+
+cleaning_ref<- function(ms2){
+  ms2_tb <- as.data.frame(
+    spectraData(ms2) 
+  ) %>%
+  mutate(ms2_raw = map2(mz(ms2), intensity(ms2), ~{
+    if (length(.x) == 0 || length(.y) == 0)
+      return(data.frame(mz = numeric(0), intensity = numeric(0)))
+    data.frame(mz = as.numeric(.x), intensity = as.numeric(.y))
+  })) %>%
+    mutate(ms2_RLM = purrr::map(ms2_raw, function(t){
+         if (is.null(t) || nrow(t) == 0 || !"intensity" %in% names(t))
+        return(tibble(mz = numeric(0), intensity = numeric(0)))
+      t <- t %>%
+        filter(intensity>0) %>%
+        arrange(intensity) %>%
+        mutate(order = seq(nrow(.)))
+      p75 <- t %>%
+        pull(intensity) %>% 
+        quantile(0.75)
+      u <- t %>%
+        filter(intensity < p75)
+      if(nrow(u)>3){
+        mdl <- rlm(data = u, log10(intensity) ~ order)
+        t_filt<- t %>% 
+          mutate(pred = predict(mdl, t)) %>%
+          mutate(res = abs(pred - log10(intensity))) %>%
+          filter(res > sd(residuals(mdl))*3) %>%
+          arrange(mz)
+        if (nrow(t_filt) > 0) {
+          t<- t_filt
+        } else {
+          t<- t %>% arrange(mz)
+        }
+      } else {
+        return(t %>% arrange(mz))  # Not enough points to model
+      }
+    }))
+  ms2_cl <- ms2_tb %>%
+    mutate(
+      mz = purrr::map(ms2_RLM, ~ .x$mz),
+      intensity = purrr::map(ms2_RLM, ~ .x$intensity)
+    ) %>%
+    filter(map_lgl(mz, ~ length(.x) > 0)) %>%
+    as.data.frame() %>%
+    Spectra()
+  return(ms2_cl)
+}
+
+#loading data from neutral pseudo-spectra pairing and creation
+load("rdata/alt_msms.RData")
+```
+
+The aim is to see changes between plots before and after the subsetting realtive to neutral pseudo-spectra subset selection.
+First we need to compute matrices for entire networks, considering original feature detection obteined after feature creation in xcms processs.
+
+#Negative
+
+```{r}
+register(SerialParam())
+spsneg<- cleaning_ref(spsneg) #all dataset of feature having a MS/MS spectra
+mat_neg_all <- compareSpectra(spsneg, MAPFUN = joinPeaksGnps, tolerance = 0.01, FUN = MsCoreUtils::gnps)
+  colnames(mat_neg_all)<- rownames(mat_neg_all) <- spsneg$feature_id
+
+save(mat_neg_all, file="rdata/alt_all_MNs.RData") 
+```
+
+Comparing the full network against subsetting used for neutral pseudo-spectra creation
+Comparison with random subsets mantaining the same size ids done to evaluate the artifact of size decrease (100 repetitions).
+
+```{r}
+threshold<- 0.7
+
+#total
+adj <- mat_neg_all
+adj[adj < threshold] <- 0
+diag(adj) <- 0
+gt <- graph_from_adjacency_matrix(adj, mode = "undirected", weighted = TRUE, diag = FALSE)
+
+comp <-  cluster_louvain(gt)
+gt$comm <- comp$membership
+
+raw_mod <- modularity(gt, gt$comm)
+raw_ass<- assortativity(gt, gt$comm)
+
+#NMN subsetting
+adj <- matrix_neg
+adj[adj < threshold] <- 0
+diag(adj) <- 0
+g <- graph_from_adjacency_matrix(adj, mode = "undirected", weighted = TRUE, diag = FALSE)
+
+comp <-  cluster_louvain(g)
+g$comm <- comp$membership
+
+filt_mod<- modularity(g, g$comm)
+filt_ass<- assortativity(g, g$comm)
+
+#random subsetting
+#keeping the number equal to NMN subset
+mods <- c()
+asss <- c()
+for(i in 1:100){
+  idx <- sample(1:nrow(mat_neg_all), length(MS2neu))
+adj <- mat_neg_all[idx,idx]
+adj[adj < threshold] <- 0
+diag(adj) <- 0
+gx <- graph_from_adjacency_matrix(adj, mode = "undirected", weighted = TRUE, diag = FALSE)
+
+comp <-  cluster_louvain(gx)
+gx$comm <- comp$membership
+mods<- c(modularity(gx, gx$comm), mods)
+asss<- c(assortativity(gx, gx$comm), asss)
+}
+
+df_mod <- data.frame(
+  value = mods,
+  metric = "Modularity"
+)
+df_ass <- data.frame(
+  value = asss,
+  metric = "Assortativity"
+)
+df <- rbind(df_mod, df_ass)
+
+refs <- data.frame(
+  metric = c("Modularity", "Modularity", "Assortativity", "Assortativity"),
+  type = c("Raw", "Filtered", "Raw", "Filtered"),
+  value = c(raw_mod, filt_mod, raw_ass, filt_ass)
+)
+
+neg <- ggplot(df, aes(x = value)) +
+  geom_histogram(bins = 30, fill = "grey80", color = "black") +
+  
+  geom_vline(data = refs,
+             aes(xintercept = value, color = type, linetype = type),
+             size = 1) +
+  
+  facet_wrap(~metric, ncol = 1, scales = "free") +
+  
+scale_color_manual(values = c(
+  "Raw" = "#1B9E77",      # teal
+  "Filtered" = "#D95F02"  # burnt orange
+)) +
+  labs(x = "Value", y = "Frequency") +
+  
+  theme_minimal() +
+  theme(legend.position = "bottom",       
+        legend.title = element_blank())
+neg
+```
+
+#Positive
+
+```{r}
+register(SerialParam())
+spspos<- cleaning_ref(spspos) #all dataset of feature having a MS/MS spectra
+mat_pos_all <- compareSpectra(spspos, MAPFUN = joinPeaksGnps, tolerance = 0.01, FUN = MsCoreUtils::gnps)
+  colnames(mat_pos_all)<- rownames(mat_pos_all) <- tmppos$feature_id
+
+save(mat_neg_all,mat_pos_all, file="rdata/alt_all_MNs.RData") 
+ 
+```
+
+Comparing the full network against subsetting used for neutral pseudo-spectra creation
+Comparison with random subsets mantaining the same size ids done to evaluate the artifact of size decrease (100 repetitions).
+
+```{r}
+threshold<- 0.7
+
+#total
+adj <- mat_pos_all
+adj[adj < threshold] <- 0
+diag(adj) <- 0
+gt <- graph_from_adjacency_matrix(adj, mode = "undirected", weighted = TRUE, diag = FALSE)
+
+comp <-  cluster_louvain(gt)
+gt$comm <- comp$membership
+
+raw_mod <- modularity(gt, gt$comm)
+raw_ass<- assortativity(gt, gt$comm)
+
+#NMN subsetting
+adj <- matrix_neg
+adj[adj < threshold] <- 0
+diag(adj) <- 0
+g <- graph_from_adjacency_matrix(adj, mode = "undirected", weighted = TRUE, diag = FALSE)
+
+comp <-  cluster_louvain(g)
+g$comm <- comp$membership
+
+filt_mod<- modularity(g, g$comm)
+filt_ass<- assortativity(g, g$comm)
+
+#random subsetting
+#keeping the number equal to NMN subset
+mods <- c()
+asss <- c()
+for(i in 1:100){
+  idx <- sample(1:nrow(mat_pos_all), length(MS2neu))
+adj <- mat_pos_all[idx,idx]
+adj[adj < threshold] <- 0
+diag(adj) <- 0
+gx <- graph_from_adjacency_matrix(adj, mode = "undirected", weighted = TRUE, diag = FALSE)
+
+comp <-  cluster_louvain(gx)
+gx$comm <- comp$membership
+mods<- c(modularity(gx, gx$comm), mods)
+asss<- c(assortativity(gx, gx$comm), asss)
+}
+
+df_mod <- data.frame(
+  value = mods,
+  metric = "Modularity"
+)
+df_ass <- data.frame(
+  value = asss,
+  metric = "Assortativity"
+)
+df <- rbind(df_mod, df_ass)
+
+refs <- data.frame(
+  metric = c("Modularity", "Modularity", "Assortativity", "Assortativity"),
+  type = c("Raw", "Filtered", "Raw", "Filtered"),
+  value = c(raw_mod, filt_mod, raw_ass, filt_ass)
+)
+
+pos<- ggplot(df, aes(x = value)) +
+  geom_histogram(bins = 30, fill = "grey80", color = "black") +
+  
+  geom_vline(data = refs,
+             aes(xintercept = value, color = type, linetype = type),
+             size = 1) +
+  
+  facet_wrap(~metric, ncol = 1, scales = "free") +
+  
+scale_color_manual(values = c(
+  "Raw" = "#1B9E77",      # teal
+  "Filtered" = "#D95F02"  # burnt orange
+)) +
+  labs(x = "Value", y = "Frequency") +
+  
+  theme_minimal() +
+  theme(legend.position = "none",
+        legend.title = element_blank())
+pos
+```
+merging and saving 
+
+```{r}
+library(cowplot)
+cplot <- plot_grid(
+pos, 
+neg, 
+  ncol = 1, 
+    labels = c("Pos)", "Neg)"), 
+  label_size = 16,
+  align = "v",
+  rel_widths=c(1.1,1)
+)
+cplot
+
+ggsave("figures/all_msms_alt.png", 
+       plot = cplot, 
+       width =8, 
+       height = 7, 
+       units = "in", 
+       dpi = 300)
+```
+
