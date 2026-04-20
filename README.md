@@ -32,11 +32,14 @@ The workflow is implemented in R Markdown files, making it reproducible.
   Performs chemical similarity comparisons (Tanimoto & Overlay scores) to assess structural agreement of spectral matches.  
 
 - **`subclass_prediction.Rmd`**  
-  Subclass prediction from network neighborhoods based on majority vote for MSMS library.  
+  Subclass prediction from network neighborhoods based on majority vote for public MS/MS library.  
 
 - **`biological_sample_workflow.Rmd`**  
   Case study on fungal untargeted metabolomics. Include: chromatographic feature grouping, identification of adduct, neagtive/positive feature pairs identification and neutral pseudo-spectra creation, with relative NMN.
   
 - **`bio_sample_Subclass_Mods.Rmd`**  
   Modulairty and local modualarity claualtion across different similarity threshold, based on chamical subclass identification, to evalaute MNs clustering accuracy.
+  
+- **`mirror_plot_neutral_MSMS.Rmd`**  
+  Function to plot neutral pseudo-spectra form biological sample.
 ---
