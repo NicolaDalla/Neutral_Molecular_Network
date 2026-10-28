@@ -2,8 +2,12 @@
 
 This repository contains the R-based workflow developed for the paper:  
 
-**Neutral Molecular Networks: polarity-independent tool for mass spectrometry data analysis**  
-*Nicola Dalla Valle, Pietro Franceschi, Mar Garcia Aloy, Peter Robatscher and Michael Oberhuber*  
+**Nicola Dalla Valle, Pietro Franceschi, Mar Garcia-Aloy, Peter Robatscher, Sabine Oettl, Michael Oberhuber**
+*Neutral molecular networks: Polarity-independent tool for mass spectrometry data*
+Analytica Chimica Acta,
+Volume 1415, 2026, 345708, ISSN 0003-2670,
+https://doi.org/10.1016/j.aca.2026.345708.
+
 
 ---
 
